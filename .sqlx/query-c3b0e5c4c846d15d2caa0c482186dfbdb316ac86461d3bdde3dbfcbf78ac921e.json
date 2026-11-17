@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH stale AS (\n             UPDATE matches SET state = 'cancelled', cancelled_at = now()\n             WHERE state = 'suggested'\n               AND id IN (SELECT match_id FROM match_allocations WHERE invoice_id = ANY($1))\n             RETURNING payment_id\n         )\n         UPDATE payments SET status = 'unmatched' WHERE id IN (SELECT payment_id FROM stale)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c3b0e5c4c846d15d2caa0c482186dfbdb316ac86461d3bdde3dbfcbf78ac921e"
+}

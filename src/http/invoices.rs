@@ -1,15 +1,16 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::Date;
 
 use super::AppState;
-use super::extract::{ApiJson, ApiQuery};
+use super::extract::{ApiJson, ApiPath, ApiQuery};
 use super::pagination::{Page, page, page_size};
 use crate::domain::{CustomerId, InvoiceId, Yen};
 use crate::error::{AppError, FieldError, is_foreign_key_violation, is_unique_violation};
 use crate::repo::invoices::{self, Invoice, ListFilter, NewInvoice};
+use crate::repo::matches::{self, ClearedBy};
 
 const MAX_NUMBER_CHARS: usize = 50;
 
@@ -69,6 +70,35 @@ pub async fn create(
         }
     })?;
     Ok((StatusCode::CREATED, Json(invoice)))
+}
+
+/// An invoice with the match that cleared it: the answer to "which payment paid this?".
+#[derive(Serialize)]
+pub struct InvoiceDetail {
+    #[serde(flatten)]
+    invoice: Invoice,
+    /// `null` while the invoice is open.
+    cleared_by: Option<ClearedBy>,
+}
+
+pub async fn get(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<InvoiceId>,
+) -> Result<Json<InvoiceDetail>, AppError> {
+    // One transaction, so that the status and the match are read from the same snapshot.
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let invoice = invoices::find(&mut tx, id)
+        .await?
+        .ok_or(AppError::NotFound("invoice"))?;
+    let cleared_by = matches::confirmed_for_invoice(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(Json(InvoiceDetail {
+        invoice,
+        cleared_by,
+    }))
 }
 
 pub async fn list(

@@ -30,6 +30,20 @@ pub struct Allocation {
     pub amount: Yen,
 }
 
+/// The confirmed match an invoice was cleared by.
+#[derive(Debug, Serialize)]
+pub struct ClearedBy {
+    pub match_id: MatchId,
+    pub payment_id: PaymentId,
+    pub rule: String,
+    /// The transfer fee of the whole match.
+    pub fee_amount: Yen,
+    /// The cash of the payment applied to this invoice.
+    pub amount: Yen,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub confirmed_at: Option<OffsetDateTime>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchState {
     Suggested,
@@ -138,6 +152,23 @@ pub async fn allocations_of(
     .await
 }
 
+/// The confirmed match that names the invoice. There is at most one (invariant I2).
+pub async fn confirmed_for_invoice(
+    conn: &mut PgConnection,
+    invoice_id: InvoiceId,
+) -> sqlx::Result<Option<ClearedBy>> {
+    sqlx::query_as!(
+        ClearedBy,
+        r#"SELECT m.id AS "match_id: MatchId", m.payment_id AS "payment_id: PaymentId", m.rule,
+                  m.fee_amount AS "fee_amount: Yen", a.amount AS "amount: Yen", m.confirmed_at
+           FROM match_allocations a JOIN matches m ON m.id = a.match_id
+           WHERE a.invoice_id = $1 AND m.state = 'confirmed'"#,
+        invoice_id.0,
+    )
+    .fetch_optional(conn)
+    .await
+}
+
 pub async fn set_confirmed(conn: &mut PgConnection, id: MatchId) -> sqlx::Result<()> {
     sqlx::query!(
         "UPDATE matches SET state = 'confirmed', confirmed_at = now() WHERE id = $1",
@@ -146,6 +177,29 @@ pub async fn set_confirmed(conn: &mut PgConnection, id: MatchId) -> sqlx::Result
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// Cancels every suggestion that names one of the invoices and leaves its payment unmatched. Called when
+/// the invoices are cleared: such a suggestion could never be confirmed any more. Returns how many payments
+/// lost their suggestion.
+pub async fn cancel_suggestions_naming(
+    conn: &mut PgConnection,
+    invoice_ids: &[InvoiceId],
+) -> sqlx::Result<u64> {
+    let ids: Vec<uuid::Uuid> = invoice_ids.iter().map(|id| id.0).collect();
+    let done = sqlx::query!(
+        "WITH stale AS (
+             UPDATE matches SET state = 'cancelled', cancelled_at = now()
+             WHERE state = 'suggested'
+               AND id IN (SELECT match_id FROM match_allocations WHERE invoice_id = ANY($1))
+             RETURNING payment_id
+         )
+         UPDATE payments SET status = 'unmatched' WHERE id IN (SELECT payment_id FROM stale)",
+        &ids,
+    )
+    .execute(conn)
+    .await?;
+    Ok(done.rows_affected())
 }
 
 pub async fn set_cancelled(conn: &mut PgConnection, id: MatchId) -> sqlx::Result<()> {

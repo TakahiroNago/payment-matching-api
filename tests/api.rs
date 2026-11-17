@@ -16,6 +16,7 @@ use payment_matching_api::domain::matching::MatchingConfig;
 use payment_matching_api::http::{AppState, router};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-token-0123456789";
@@ -924,13 +925,72 @@ async fn repeating_an_import_writes_nothing(pool: PgPool) {
     assert_problem(&different, StatusCode::CONFLICT, "conflict");
     assert_eq!(api.count("payments").await, 2);
 
-    // The same content under a new key is a new statement, matched against what is open by then.
-    api.invoice(&customer, "INV-002", 110_000, "2026-12-31")
+    // The same content under a new key is refused as well: a statement sent twice must not be matched
+    // against whatever is open by then, which here is next month's invoice of the same amount.
+    let next_month = api
+        .invoice(&customer, "INV-002", 110_000, "2026-12-31")
         .await;
     let new_key = api.import("statement-2026-11-11", &lines).await;
-    assert_eq!(new_key.status, StatusCode::CREATED);
-    assert_eq!(new_key.body["payments"][0]["status"], "matched");
+    assert_problem(&new_key, StatusCode::CONFLICT, "conflict");
+    let first_batch = first.body["batch_id"].as_str().unwrap();
+    assert!(
+        new_key.body["detail"]
+            .as_str()
+            .unwrap()
+            .contains(first_batch),
+        "{}",
+        new_key.body
+    );
+    assert_eq!(api.count("payments").await, 2);
+    assert_eq!(api.count("payment_batches").await, 1);
+    assert_eq!(api.invoice_status(&next_month).await, "open");
+
+    // The refusal did not consume the key, and a caller who means it can say so.
+    let insisted = api
+        .post_with(
+            "/v1/payment-batches",
+            json!({
+                "allow_duplicate": true,
+                "payments": [
+                    { "paid_on": "2026-11-10", "amount": 110_000, "payer_name": "ﾔﾏﾀﾞｼﾖｳｼﾞ" },
+                    { "paid_on": "2026-11-10", "amount": 5_000, "payer_name": "ﾌﾒｲ" },
+                ],
+            }),
+            &[("Idempotency-Key", "statement-2026-11-11")],
+        )
+        .await;
+    assert_eq!(insisted.status, StatusCode::CREATED, "{}", insisted.body);
+    assert_eq!(insisted.body["payments"][0]["status"], "matched");
     assert_eq!(api.count("payments").await, 4);
+    assert_eq!(api.invoice_status(&next_month).await, "cleared");
+}
+
+#[sqlx::test]
+async fn a_request_that_does_not_get_the_matching_lock_in_time_is_turned_away(
+    options: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    // As in `main`, with a shorter wait.
+    let pool = options
+        .connect_with(connect.options([("lock_timeout", "200ms")]))
+        .await
+        .unwrap();
+    let api = Api::new(pool);
+
+    // Another request is in the middle of matching.
+    let mut holder = api.pool.begin().await.unwrap();
+    payment_matching_api::repo::payments::lock_matching(&mut holder)
+        .await
+        .unwrap();
+
+    let reply = api.import("waits", &[("ﾌﾒｲ", 5_000)]).await;
+    assert_problem(&reply, StatusCode::SERVICE_UNAVAILABLE, "busy");
+    assert_eq!(api.count("payment_batches").await, 0);
+
+    // Nothing was written, so the same request goes through once the lock is free.
+    holder.rollback().await.unwrap();
+    let retry = api.import("waits", &[("ﾌﾒｲ", 5_000)]).await;
+    assert_eq!(retry.status, StatusCode::CREATED, "{}", retry.body);
 }
 
 #[sqlx::test]
@@ -1044,13 +1104,93 @@ async fn an_invoice_is_cleared_once_when_two_matches_are_confirmed_at_the_same_t
     assert_eq!(confirmed, 1);
     let matched = api.get("/v1/payments?status=matched").await;
     assert_eq!(matched.body["items"].as_array().unwrap().len(), 1);
-    // The loser keeps its suggestion; a person can dismiss it or match the payment to something else.
-    assert_eq!(
-        api.get("/v1/payments?status=suggested").await.body["items"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
+    // The loser's suggestion went away with the invoice: its payment is unmatched, for a person to match to
+    // something else.
+    for (status, expected) in [("suggested", 0), ("unmatched", 1)] {
+        let listed = api.get(&format!("/v1/payments?status={status}")).await;
+        assert_eq!(
+            listed.body["items"].as_array().unwrap().len(),
+            expected,
+            "{status}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn clearing_an_invoice_cancels_the_suggestions_of_other_payments_that_name_it(pool: PgPool) {
+    let api = Api::new(pool);
+    let customer = api
+        .customer("株式会社山田商事", "ヤマダショウジ", false)
+        .await;
+    let invoice = api
+        .invoice(&customer, "INV-001", 88_000, "2026-11-30")
+        .await;
+    let other_invoice = api
+        .invoice(&customer, "INV-002", 77_000, "2026-11-30")
+        .await;
+
+    // Two payments from unknown payers are suggested (R4), one for each invoice.
+    let unknown = api
+        .import("day-1", &[("ﾌﾒｲ ｲﾁ", 88_000), ("ﾌﾒｲ ﾆ", 77_000)])
+        .await;
+    assert_eq!(unknown.body["summary"]["suggested"], 2);
+    let stale_payment = format!("/v1/payments/{}", id_of(&unknown.body["payments"][0]));
+    let kept_payment = format!("/v1/payments/{}", id_of(&unknown.body["payments"][1]));
+    let stale_match = active_match_id(&api.get(&stale_payment).await.body);
+
+    let open = api.get(&format!("/v1/invoices/{invoice}")).await;
+    assert_eq!(open.status, StatusCode::OK);
+    assert_eq!(open.body["status"], "open");
+    assert_eq!(open.body["cleared_by"], Value::Null);
+
+    // The customer's own payment of the first invoice arrives and is confirmed without a person.
+    let known = api.import("day-2", &[("ﾔﾏﾀﾞｼﾖｳｼﾞ", 88_000)]).await;
+    let payer = &known.body["payments"][0];
+    assert_eq!(payer["status"], "matched");
+
+    // The suggestion that named the invoice is cancelled and its payment is unmatched; the match stays as
+    // history and can no longer be confirmed.
+    let stale = api.get(&stale_payment).await.body;
+    assert_eq!(stale["status"], "unmatched");
+    assert_eq!(stale["matches"][0]["id"], stale_match.as_str());
+    assert_eq!(stale["matches"][0]["state"], "cancelled");
+    assert_problem(
+        &api.post_empty(&format!("/v1/matches/{stale_match}/confirm"))
+            .await,
+        StatusCode::CONFLICT,
+        "conflict",
+    );
+
+    // The suggestion for the other invoice is untouched.
+    let kept = api.get(&kept_payment).await.body;
+    assert_eq!(kept["status"], "suggested");
+    assert_eq!(api.invoice_status(&other_invoice).await, "open");
+
+    // The invoice names the payment that cleared it.
+    let cleared = api.get(&format!("/v1/invoices/{invoice}")).await.body;
+    assert_eq!(cleared["status"], "cleared");
+    assert_eq!(cleared["invoice_number"], "INV-001");
+    assert_eq!(cleared["cleared_by"]["payment_id"], payer["id"]);
+    assert_eq!(cleared["cleared_by"]["rule"], "R1");
+    assert_eq!(cleared["cleared_by"]["amount"], 88_000);
+    assert_eq!(cleared["cleared_by"]["fee_amount"], 0);
+    assert!(cleared["cleared_by"]["confirmed_at"].is_string());
+
+    // Cancelling the match gives the invoice back.
+    let cancel = format!(
+        "/v1/matches/{}/cancel",
+        cleared["cleared_by"]["match_id"].as_str().unwrap()
+    );
+    assert_eq!(api.post_empty(&cancel).await.status, StatusCode::OK);
+    let reopened = api.get(&format!("/v1/invoices/{invoice}")).await.body;
+    assert_eq!(reopened["status"], "open");
+    assert_eq!(reopened["cleared_by"], Value::Null);
+
+    assert_problem(
+        &api.get("/v1/invoices/019a0000-0000-7000-8000-000000000000")
+            .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
     );
 }
 

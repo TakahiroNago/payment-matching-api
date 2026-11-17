@@ -1,9 +1,10 @@
-use std::time::Instant;
+use std::any::Any;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -15,8 +16,13 @@ use crate::error::{AppError, problem};
 
 static REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
+/// How long a request may run. The largest import takes a fraction of this; a request that is still running
+/// is stuck on something (the database, mostly) and is dropped, which rolls its transaction back.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Gives every request an id, logs its outcome and returns the id in the `x-request-id` header. A 500
-/// response gets a body that carries the id and nothing else about the failure.
+/// response gets a body that carries the id and nothing else about the failure. A request that runs longer
+/// than [`REQUEST_TIMEOUT`] is answered with 503.
 ///
 /// Only the method, the path, the status and the duration are logged: no query string, no body, no payer
 /// names or amounts.
@@ -39,7 +45,11 @@ pub async fn request_context(request: Request, next: Next) -> Response {
         path = %request.uri().path(),
     );
     let started = Instant::now();
-    let mut response = next.run(request).instrument(span.clone()).await;
+    let handled = tokio::time::timeout(REQUEST_TIMEOUT, next.run(request).instrument(span.clone()));
+    let mut response = match handled.await {
+        Ok(response) => response,
+        Err(_) => AppError::Timeout.into_response(),
+    };
 
     if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
         response = problem(
@@ -63,6 +73,18 @@ pub async fn request_context(request: Request, next: Next) -> Response {
         );
     });
     response
+}
+
+/// The response to a handler that panicked: a 500 like any other (the request-context middleware gives it its
+/// body), with the panic message in the log. Without this the connection would just close.
+pub fn panic_response(panic: Box<dyn Any + Send + 'static>) -> Response {
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("a panic without a message");
+    tracing::error!(panic = message, "request handler panicked");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 /// Requires `Authorization: Bearer <API_TOKEN>`.
@@ -93,7 +115,62 @@ fn tokens_match(presented: &str, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::tokens_match;
+    #![allow(clippy::unwrap_used)]
+
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use tower_http::catch_panic::CatchPanicLayer;
+
+    use super::{panic_response, request_context, tokens_match};
+
+    async fn get_from(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The layers of the real router around handlers that misbehave.
+    fn misbehaving() -> Router {
+        Router::new()
+            .route(
+                "/panic",
+                get(|| async {
+                    panic!("boom");
+                    #[allow(unreachable_code)]
+                    ()
+                }),
+            )
+            .route(
+                "/slow",
+                get(|| async { tokio::time::sleep(Duration::from_secs(3600)).await }),
+            )
+            .layer(CatchPanicLayer::custom(panic_response))
+            .layer(axum::middleware::from_fn(request_context))
+    }
+
+    #[tokio::test]
+    async fn a_panic_is_an_internal_error_with_a_request_id() {
+        let (status, body) = get_from(misbehaving(), "/panic").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], "internal_error");
+        assert!(body["request_id"].is_string());
+        assert!(!body.to_string().contains("boom"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_runs_too_long_is_dropped() {
+        let (status, body) = get_from(misbehaving(), "/slow").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "timeout");
+    }
 
     #[test]
     fn tokens_match_only_when_equal() {

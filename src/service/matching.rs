@@ -7,6 +7,8 @@
 //!   conditional `UPDATE` and compares the row count; whoever comes second gets a conflict.
 //! - I3: for a confirmed match, the allocations add up to the payment, and allocations + fee add up to the
 //!   invoices. Checked here before anything is confirmed.
+//! - I5: a suggestion names open invoices only. [`clear_invoices`] cancels the suggestions of other payments
+//!   that name an invoice it clears.
 
 use sqlx::{PgConnection, PgPool};
 
@@ -50,6 +52,11 @@ pub(crate) async fn record_match(
     Ok(match_id)
 }
 
+/// Clears the invoices of a match that is already recorded as confirmed.
+///
+/// Suggestions of other payments that name one of the invoices are cancelled and their payments go back to
+/// `unmatched`: they could never be confirmed, and a payment listed as `suggested` should have a suggestion
+/// that a person can act on.
 async fn clear_invoices(conn: &mut PgConnection, ids: &[InvoiceId]) -> Result<(), AppError> {
     let cleared = invoices::mark_cleared(conn, ids).await?;
     if cleared != ids.len() as u64 {
@@ -57,6 +64,7 @@ async fn clear_invoices(conn: &mut PgConnection, ids: &[InvoiceId]) -> Result<()
             "an invoice of the match is no longer open",
         ));
     }
+    matches::cancel_suggestions_naming(conn, ids).await?;
     Ok(())
 }
 
@@ -90,8 +98,9 @@ pub async fn confirm(
     }
 
     let ids: Vec<InvoiceId> = allocations.iter().map(|a| a.invoice_id).collect();
-    clear_invoices(&mut tx, &ids).await?;
+    // Confirmed first: clearing cancels whatever is still a suggestion on these invoices.
     matches::set_confirmed(&mut tx, match_id).await?;
+    clear_invoices(&mut tx, &ids).await?;
     payments::set_status(&mut tx, payment.id, PaymentStatus::Matched).await?;
 
     if register_alias {
