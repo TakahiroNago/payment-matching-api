@@ -50,6 +50,10 @@ pub struct ExistingBatch {
 /// One lock for the whole application is coarse, but it removes every ordering question between a batch that
 /// reads a customer's open invoices and a confirmation that clears some of them. A lock per customer would be
 /// the next step if the volume called for it.
+///
+/// The wait is bounded by the `lock_timeout` of the connection (set in `main`). A request that waits longer
+/// fails with `lock_not_available`, which the API answers with 503 instead of holding a pooled connection for
+/// as long as the queue lasts.
 pub async fn lock_matching(conn: &mut PgConnection) -> sqlx::Result<()> {
     // The key is arbitrary; it only has to be the same everywhere.
     const MATCHING_LOCK_KEY: i64 = 0x7061_796d_6174_6368; // "paymatch"
@@ -86,6 +90,24 @@ pub async fn find_batch_by_key(
         ExistingBatch,
         r#"SELECT id AS "id: BatchId", request_hash FROM payment_batches WHERE idempotency_key = $1"#,
         idempotency_key,
+    )
+    .fetch_optional(conn)
+    .await
+}
+
+/// The oldest other batch with the same request content, if any.
+pub async fn find_batch_by_hash(
+    conn: &mut PgConnection,
+    request_hash: &[u8],
+    except: BatchId,
+) -> sqlx::Result<Option<BatchId>> {
+    sqlx::query_scalar!(
+        r#"SELECT id AS "id: BatchId" FROM payment_batches
+           WHERE request_hash = $1 AND id <> $2
+           ORDER BY id
+           LIMIT 1"#,
+        request_hash,
+        except.0,
     )
     .fetch_optional(conn)
     .await

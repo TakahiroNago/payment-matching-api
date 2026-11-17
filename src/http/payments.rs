@@ -24,6 +24,10 @@ const MAX_REPORTED_ERRORS: usize = 50;
 #[serde(deny_unknown_fields)]
 pub struct ImportRequest {
     payments: Vec<PaymentLine>,
+    /// Import the payments although the same payments were already imported under another idempotency key.
+    /// Not part of the request hash: it does not change what the request imports.
+    #[serde(default, skip_serializing)]
+    allow_duplicate: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -72,6 +76,7 @@ pub async fn import(
 
     // The hash is taken over the parsed request written back out, so that the same payments in another
     // layout (whitespace, key order) count as the same request.
+    let allow_duplicate = body.allow_duplicate;
     let canonical = serde_json::to_vec(&body)
         .map_err(|e| AppError::Internal(format!("request is not serializable: {e}")))?;
     let request_hash = Sha256::digest(&canonical);
@@ -90,6 +95,7 @@ pub async fn import(
         &state.config.matching,
         key,
         request_hash.as_slice(),
+        allow_duplicate,
         &lines,
     )
     .await?;

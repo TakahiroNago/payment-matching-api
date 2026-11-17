@@ -49,6 +49,18 @@ pub async fn insert(conn: &mut PgConnection, new: &NewInvoice<'_>) -> sqlx::Resu
     .await
 }
 
+pub async fn find(conn: &mut PgConnection, id: InvoiceId) -> sqlx::Result<Option<Invoice>> {
+    sqlx::query_as!(
+        Invoice,
+        r#"SELECT id AS "id: InvoiceId", customer_id AS "customer_id: CustomerId", invoice_number,
+                  amount AS "amount: Yen", due_date, status, created_at
+           FROM invoices WHERE id = $1"#,
+        id.0,
+    )
+    .fetch_optional(conn)
+    .await
+}
+
 pub struct ListFilter<'a> {
     pub status: Option<&'a str>,
     pub customer_id: Option<CustomerId>,

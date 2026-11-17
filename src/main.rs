@@ -11,9 +11,14 @@ use std::time::Duration;
 
 use payment_matching_api::config::Config;
 use payment_matching_api::http::{AppState, router};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
+
+/// How long a statement waits for a lock, the matching lock above all (`repo::payments::lock_matching`).
+/// Imports, confirmations and cancellations queue on that lock, each holding a pooled connection; without a
+/// bound a long queue would leave no connection for reads and for `/readyz`.
+const LOCK_TIMEOUT: &str = "5s";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -44,10 +49,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let config = Config::from_env()?;
+    let connect = config
+        .database_url
+        .parse::<PgConnectOptions>()?
+        .options([("lock_timeout", LOCK_TIMEOUT)]);
     let pool = PgPoolOptions::new()
         .max_connections(config.db_max_connections)
         .acquire_timeout(Duration::from_secs(5))
-        .connect(&config.database_url)
+        .connect_with(connect)
         .await?;
 
     if command == "migrate" {

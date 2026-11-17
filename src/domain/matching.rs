@@ -206,9 +206,12 @@ fn decide_known_payer(
         }
     }
 
+    // Built after R1, which needs no search and settles most payments.
+    let search = (!subset_search_skipped).then(|| Combinations::new(&invoices));
+
     // R2
-    if !subset_search_skipped {
-        let combinations = combinations_summing_to(&invoices, amount, 2);
+    if let Some(search) = &search {
+        let combinations = search.summing_to(amount, 2);
         let several = combinations.len() > 1;
         if let Some(first) = combinations.into_iter().next() {
             let invoice_ids = first.iter().map(|i| i.id).collect();
@@ -249,9 +252,10 @@ fn decide_known_payer(
                     .filter(covers_fee)
                     .map(|c| (fee, c)),
             );
-            if !subset_search_skipped {
+            if let Some(search) = &search {
                 explanations.extend(
-                    combinations_summing_to(&invoices, billed, 2)
+                    search
+                        .summing_to(billed, 2)
                         .into_iter()
                         .filter(covers_fee)
                         .map(|c| (fee, c)),
@@ -287,59 +291,93 @@ fn oldest_first<'a>(invoices: impl Iterator<Item = &'a OpenInvoice>) -> Vec<&'a 
     sorted
 }
 
-/// Up to `limit` sets of two or more invoices whose amounts add up to `target`. The first set found is the one
-/// that prefers the oldest invoices. `limit` is 2 everywhere: enough to tell "unique" from "several".
-fn combinations_summing_to<'a>(
-    invoices: &[&'a OpenInvoice],
-    target: Yen,
-    limit: usize,
-) -> Vec<Vec<&'a OpenInvoice>> {
-    // remaining_total[i] = the sum of invoices[i..]; a branch that cannot reach the target is cut.
-    let mut remaining_total = vec![Yen::ZERO; invoices.len() + 1];
-    for (i, invoice) in invoices.iter().enumerate().rev() {
-        remaining_total[i] = remaining_total[i + 1] + invoice.amount;
-    }
-    let mut search = SubsetSearch {
-        invoices,
-        remaining_total,
-        limit,
-        chosen: Vec::new(),
-        found: Vec::new(),
-    };
-    search.visit(0, target);
-    search.found
-}
-
-struct SubsetSearch<'s, 'a> {
+/// Searches the invoices of a customer for sets of two or more whose amounts add up to a target.
+///
+/// The search walks the invoices oldest first and tries "with this invoice" before "without it", so the first
+/// set found is the one that prefers the oldest invoices. Two cuts keep it short:
+///
+/// - a branch whose remaining invoices cannot reach the target ends;
+/// - halfway through the invoices, a branch ends unless some set of the second half has exactly the amount
+///   still missing. The sums of the second half are computed once and serve every target.
+///
+/// With n invoices that leaves about 2^(n/2) steps for each half instead of 2^n for the whole: the second
+/// half is entered only where a set lies ahead, and the search stops at `limit` sets.
+struct Combinations<'s, 'a> {
+    /// Oldest first.
     invoices: &'s [&'a OpenInvoice],
+    /// `remaining_total[i]` is the sum of `invoices[i..]`.
     remaining_total: Vec<Yen>,
-    limit: usize,
-    chosen: Vec<&'a OpenInvoice>,
-    found: Vec<Vec<&'a OpenInvoice>>,
+    /// Where the second half starts.
+    half: usize,
+    /// Every sum a non-empty set of `invoices[half..]` can have, ascending and without duplicates.
+    second_half_sums: Vec<Yen>,
 }
 
-impl SubsetSearch<'_, '_> {
-    fn visit(&mut self, index: usize, missing: Yen) {
-        if self.found.len() >= self.limit {
+impl<'s, 'a> Combinations<'s, 'a> {
+    fn new(invoices: &'s [&'a OpenInvoice]) -> Self {
+        let mut remaining_total = vec![Yen::ZERO; invoices.len() + 1];
+        for (i, invoice) in invoices.iter().enumerate().rev() {
+            remaining_total[i] = remaining_total[i + 1] + invoice.amount;
+        }
+
+        let half = invoices.len() / 2;
+        let mut sums = vec![Yen::ZERO];
+        for invoice in &invoices[half..] {
+            let with_invoice: Vec<Yen> = sums.iter().map(|sum| *sum + invoice.amount).collect();
+            sums.extend(with_invoice);
+        }
+        sums.sort_unstable();
+        sums.dedup();
+        // Amounts are positive, so zero is the sum of the empty set only.
+        sums.retain(|sum| *sum != Yen::ZERO);
+
+        Self {
+            invoices,
+            remaining_total,
+            half,
+            second_half_sums: sums,
+        }
+    }
+
+    /// Up to `limit` sets, the one that prefers the oldest invoices first. `limit` is 2 everywhere: enough to
+    /// tell "unique" from "several".
+    fn summing_to(&self, target: Yen, limit: usize) -> Vec<Vec<&'a OpenInvoice>> {
+        let mut found = Vec::new();
+        self.visit(0, target, limit, &mut Vec::new(), &mut found);
+        found
+    }
+
+    fn visit(
+        &self,
+        index: usize,
+        missing: Yen,
+        limit: usize,
+        chosen: &mut Vec<&'a OpenInvoice>,
+        found: &mut Vec<Vec<&'a OpenInvoice>>,
+    ) {
+        if found.len() >= limit {
             return;
         }
         if missing == Yen::ZERO {
             // Amounts are positive, so adding another invoice would overshoot: this branch ends here.
-            if self.chosen.len() >= 2 {
-                self.found.push(self.chosen.clone());
+            if chosen.len() >= 2 {
+                found.push(chosen.clone());
             }
             return;
         }
         if index == self.invoices.len() || missing > self.remaining_total[index] {
             return;
         }
+        if index == self.half && self.second_half_sums.binary_search(&missing).is_err() {
+            return;
+        }
         let invoice = self.invoices[index];
         if invoice.amount <= missing {
-            self.chosen.push(invoice);
-            self.visit(index + 1, missing - invoice.amount);
-            self.chosen.pop();
+            chosen.push(invoice);
+            self.visit(index + 1, missing - invoice.amount, limit, chosen, found);
+            chosen.pop();
         }
-        self.visit(index + 1, missing);
+        self.visit(index + 1, missing, limit, chosen, found);
     }
 }
 
@@ -477,6 +515,46 @@ mod tests {
             Decision::Unmatched {
                 reason: UnmatchedReason::NoCandidate,
                 subset_search_skipped: true
+            }
+        );
+    }
+
+    /// Twenty invoices, the most the search accepts: amounts are distinct powers of two, so every sum has
+    /// exactly one set, and the sets below span both halves of the invoices.
+    #[test]
+    fn r2_searches_the_largest_accepted_number_of_invoices() {
+        let invoices: Vec<OpenInvoice> = (0..20u8)
+            .map(|n| invoice(u128::from(n) + 1, 1_000 << n, (2026, 10, n + 1)))
+            .collect();
+        let all: i64 = invoices.iter().map(|i| i.amount.0).sum();
+
+        assert_eq!(
+            decide(Yen(all), known(&invoices, false), &config()),
+            Decision::AutoConfirmed {
+                rule: Rule::R2,
+                invoice_ids: (1..=20).map(id).collect(),
+                fee_amount: Yen::ZERO
+            }
+        );
+        // The oldest, one from the first half and the newest.
+        assert_eq!(
+            decide(
+                Yen(1_000 + (1_000 << 7) + (1_000 << 19)),
+                known(&invoices, false),
+                &config()
+            ),
+            Decision::AutoConfirmed {
+                rule: Rule::R2,
+                invoice_ids: vec![id(1), id(8), id(20)],
+                fee_amount: Yen::ZERO
+            }
+        );
+        // No set has an amount that is not a multiple of 1,000, with or without a fee.
+        assert_eq!(
+            decide(Yen(all - 500), known(&invoices, true), &config()),
+            Decision::Unmatched {
+                reason: UnmatchedReason::NoCandidate,
+                subset_search_skipped: false
             }
         );
     }

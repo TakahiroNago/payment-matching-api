@@ -30,11 +30,16 @@ pub struct ImportOutcome {
 ///
 /// A request repeated with the same key and the same content writes nothing. The same key with other content
 /// is a conflict.
+///
+/// The same content under another key is a conflict too, unless `allow_duplicate` is set: a statement sent
+/// twice by a client that makes up a key per request would otherwise be imported twice, and its second copy
+/// matched to whatever invoices of the same amounts are still open (next month's, typically).
 pub async fn import(
     pool: &PgPool,
     config: &MatchingConfig,
     idempotency_key: &str,
     request_hash: &[u8],
+    allow_duplicate: bool,
     lines: &[ImportLine],
 ) -> Result<ImportOutcome, AppError> {
     let mut tx = pool.begin().await?;
@@ -57,6 +62,15 @@ pub async fn import(
             replayed: true,
             payments,
         });
+    }
+
+    if !allow_duplicate
+        && let Some(earlier) = payments::find_batch_by_hash(&mut tx, request_hash, batch_id).await?
+    {
+        return Err(AppError::conflict(format!(
+            "the same payments were already imported as batch {earlier}; \
+             set allow_duplicate to import them again"
+        )));
     }
 
     for (index, line) in lines.iter().enumerate() {

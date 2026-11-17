@@ -15,6 +15,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use sqlx::PgPool;
+use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -34,6 +35,7 @@ pub fn router(state: AppState) -> Router {
         .route("/customers/{id}", get(customers::get))
         .route("/customers/{id}/aliases", post(customers::add_alias))
         .route("/invoices", post(invoices::create).get(invoices::list))
+        .route("/invoices/{id}", get(invoices::get))
         .route("/payment-batches", post(payments::import))
         .route("/payments", get(payments::list))
         .route("/payments/{id}", get(payments::get))
@@ -51,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/v1", v1)
         .fallback(|| async { AppError::NotFound("resource") })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::custom(middleware::panic_response))
         .layer(axum::middleware::from_fn(middleware::request_context))
         .with_state(state)
 }

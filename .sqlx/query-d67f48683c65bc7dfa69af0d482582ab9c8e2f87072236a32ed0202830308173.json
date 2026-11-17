@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: BatchId\" FROM payment_batches\n           WHERE request_hash = $1 AND id <> $2\n           ORDER BY id\n           LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: BatchId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payment_batches",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d67f48683c65bc7dfa69af0d482582ab9c8e2f87072236a32ed0202830308173"
+}

@@ -17,6 +17,7 @@
 | POST | `/v1/customers/{id}/aliases` | 別名の登録 | 201 |
 | POST | `/v1/invoices` | 請求の登録 | 201 |
 | GET | `/v1/invoices` | 請求の一覧 | 200 |
+| GET | `/v1/invoices/{id}` | 請求と、それを消し込んだ消込 | 200 |
 | POST | `/v1/payment-batches` | 入金の取り込みと自動突合 | 201（再送は 200） |
 | GET | `/v1/payments` | 入金の一覧 | 200 |
 | GET | `/v1/payments/{id}` | 入金と、その消込の履歴 | 200 |
@@ -53,6 +54,8 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 | 422 | `validation_failed` | 値が受け付けられない。`errors` に `field` と `code` |
 | 500 | `internal_error` | サーバー側の失敗。原因は返さず、`request_id` を返す |
 | 503 | `unavailable` | `/readyz` で DB に届かない |
+| 503 | `busy` | 混んでいて受け付けられなかった（消込のロックを 5 秒待っても取れない、DB の接続が空かない）。何も書き込まれていないので、同じ要求をそのまま再送できる。`Retry-After` つき |
+| 503 | `timeout` | 処理が 30 秒を超えて打ち切られた。書き込みは取り消されるが、確定（コミット）の最中だった場合だけは反映されていることがあるので、書き込みを再送する前に状態を確かめる（取り込みは同じキーで再送すれば安全）。`Retry-After` つき |
 
 `errors[].code` の値：`required`、`too_long`、`invalid_characters`（制御文字）、`out_of_range`、`unknown_value`、`not_normalizable`、`not_found`、`duplicate`、`different_customers`、`amount_mismatch`、`payer_name_not_normalizable`、`invalid`。
 
@@ -131,6 +134,20 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 
 登録順に並びます。`next_cursor` が `null` なら最後のページです。
 
+### `GET /v1/invoices/{id}`
+
+請求に、それを消し込んだ確定済みの消込を加えたものです。「この請求はどの入金で消えたか」を請求の側から辿れます。
+
+```json
+{ "id": "019a…", "customer_id": "019a…", "invoice_number": "INV-2026-001",
+  "amount": 110000, "due_date": "2026-11-30", "status": "cleared",
+  "created_at": "2026-11-18T03:00:00.123456Z",
+  "cleared_by": { "match_id": "019a…", "payment_id": "019a…", "rule": "R3", "fee_amount": 440,
+                  "amount": 109560, "confirmed_at": "2026-11-18T03:05:00.123456Z" } }
+```
+
+`cleared_by` は未消込（`open`）なら `null`。`amount` はこの請求に充てた入金額、`fee_amount` は消込全体の手数料です。根拠と履歴は `GET /v1/payments/{payment_id}` で見ます。
+
 ---
 
 ## 入金
@@ -147,6 +164,7 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 ```
 
 - `payments` は 1〜1,000 行。`payer_name` は 200 文字まで。空文字も可（金額だけで判定されます）。
+- `allow_duplicate`（省略可、既定 `false`）：取り込み済みのバッチと同じ内容を、別のキーで取り込むことを認めます。
 - 行は上から順に判定され、前の行が消し込んだ請求は後の行の対象になりません。
 
 201（新規）または 200（同じキー・同じ内容の再送。`replayed: true`）：
@@ -169,6 +187,7 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 
 - 400：`Idempotency-Key` がない。
 - 409：同じキーが、別の内容で使われている。
+- 409：別のキーで、同じ内容（同じ行が同じ順）が取り込み済み。`detail` にそのバッチの ID。同じ明細を 2 回送ったときの二重計上を防ぐためで、本当に同じ内容をもう一度取り込むなら `allow_duplicate: true` をつけます。このとき、キーは消費されません。
 - 取り込みが途中で失敗した場合は何も書き込まれず、同じキーで再送できます。
 
 #### `decision`
@@ -231,6 +250,8 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 ```
 
 `register_alias` を `true` にすると、入金の名義をその取引先の別名（`source: "learned"`）として登録し、次回から名義で特定できるようにします。
+
+請求が消し込まれると（確定・手動消込・取り込み時の自動確定のどれでも）、同じ請求を含む他の入金の候補は取消になり、その入金は `unmatched` に戻ります。確定できなくなった候補を残さないためです。
 
 - 409：消込が `suggested` でない。請求が既に消込済み。`register_alias` の名義が別の取引先のもの。
 - 422 `register_alias: payer_name_not_normalizable`：入金に、別名にできる名義がない。

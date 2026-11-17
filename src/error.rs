@@ -46,6 +46,15 @@ pub enum AppError {
     UnsupportedMediaType,
     #[error("database unavailable")]
     Unavailable,
+    /// The server could not take the request now: the matching lock or a pooled connection was not free in
+    /// time. Nothing was written; the same request can be sent again.
+    #[error("busy")]
+    Busy,
+    /// The request ran longer than the server allows and was abandoned. Its transaction is rolled back unless
+    /// the commit was already on its way, so the caller has to look before repeating a write (an import is
+    /// safe to repeat under the same idempotency key).
+    #[error("timed out")]
+    Timeout,
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     /// A broken invariant. Never the caller's fault.
@@ -71,7 +80,7 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Unavailable | Self::Busy | Self::Timeout => StatusCode::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -87,6 +96,8 @@ impl AppError {
             Self::PayloadTooLarge => "payload_too_large",
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::Unavailable => "unavailable",
+            Self::Busy => "busy",
+            Self::Timeout => "timeout",
             Self::Database(_) | Self::Internal(_) => "internal_error",
         }
     }
@@ -122,8 +133,31 @@ pub fn problem(
     response
 }
 
+/// Whether the database turned the request away for lack of capacity, not because of the request: no pooled
+/// connection became free in time, or a lock was not granted within `lock_timeout`.
+fn is_overload(error: &sqlx::Error) -> bool {
+    const LOCK_NOT_AVAILABLE: &str = "55P03";
+    matches!(error, sqlx::Error::PoolTimedOut)
+        || error
+            .as_database_error()
+            .is_some_and(|e| e.code().as_deref() == Some(LOCK_NOT_AVAILABLE))
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let this = match self {
+            Self::Database(error) if is_overload(&error) => {
+                tracing::warn!(%error, "request turned away");
+                Self::Busy
+            }
+            other => other,
+        };
+        this.render()
+    }
+}
+
+impl AppError {
+    fn render(self) -> Response {
         let status = self.status();
         let code = self.code();
         match self {
@@ -145,6 +179,18 @@ impl IntoResponse for AppError {
             Self::Database(_) | Self::Internal(_) => {
                 tracing::error!(error = %self, "request failed");
                 problem(status, code, None, json!({}))
+            }
+            Self::Busy | Self::Timeout => {
+                let detail = if matches!(self, Self::Busy) {
+                    "The server is busy. Nothing was written; send the request again shortly."
+                } else {
+                    "The request took too long and was abandoned. Check the state before repeating a write."
+                };
+                let mut response = problem(status, code, Some(detail.to_owned()), json!({}));
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                response
             }
             Self::Unavailable | Self::PayloadTooLarge | Self::UnsupportedMediaType => {
                 problem(status, code, None, json!({}))
