@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.invoice_id AS \"invoice_id: InvoiceId\", i.invoice_number,\n                  i.customer_id AS \"customer_id: CustomerId\", i.amount AS \"invoice_amount: Yen\",\n                  a.amount AS \"amount: Yen\"\n           FROM match_allocations a JOIN invoices i ON i.id = a.invoice_id\n           WHERE a.match_id = $1\n           ORDER BY i.due_date, i.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "invoice_id: InvoiceId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "match_allocations",
+            "name": "invoice_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "invoice_number",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "invoice_number"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "customer_id: CustomerId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "customer_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "invoice_amount: Yen",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "amount"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "amount: Yen",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "match_allocations",
+            "name": "amount"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d2dec66b1955a146cc58162d314d93bc93634a3206ae5c52a31082794b1f453d"
+}

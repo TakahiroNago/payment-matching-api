@@ -1,0 +1,35 @@
+# Local development and the README walkthrough. The database password is a local-only default; the API token
+# has no default and must be set in .env.
+name: payment-matching
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: payment_matching
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payment_matching"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/payment_matching
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env (see .env.example)}
+      BIND_ADDR: 0.0.0.0:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  db-data:

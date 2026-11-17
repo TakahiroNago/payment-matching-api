@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO payment_batches (id, idempotency_key, request_hash) VALUES ($1, $2, $3)\n         ON CONFLICT (idempotency_key) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cb483048c27f00e8b844401f9fb2e490bedd6c949628801bedcba6e7931c950c"
+}

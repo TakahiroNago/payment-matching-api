@@ -1,0 +1,138 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: PaymentId\", batch_id AS \"batch_id: BatchId\", line_no, paid_on,\n                  amount AS \"amount: Yen\", payer_name_raw AS payer_name, payer_name_normalized, status,\n                  decision, created_at\n           FROM payments\n           WHERE ($1::text IS NULL OR status = $1)\n             AND ($2::uuid IS NULL OR id > $2)\n           ORDER BY id\n           LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PaymentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id: BatchId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "batch_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "line_no",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "line_no"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "paid_on",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "paid_on"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "amount: Yen",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "amount"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "payer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "payer_name_raw"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "payer_name_normalized",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "payer_name_normalized"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "decision",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "decision"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9f03db48f5197d17008960efe8b58f53f72f41f9819b4f2e271bb10369e68082"
+}

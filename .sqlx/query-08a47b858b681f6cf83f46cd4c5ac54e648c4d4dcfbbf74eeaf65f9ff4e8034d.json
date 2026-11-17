@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO match_allocations (match_id, invoice_id, amount) VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "08a47b858b681f6cf83f46cd4c5ac54e648c4d4dcfbbf74eeaf65f9ff4e8034d"
+}

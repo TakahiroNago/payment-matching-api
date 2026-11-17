@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE invoices SET status = 'open' WHERE id = ANY($1) AND status = 'cleared'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0a292c67680e624459d0212fcef1720fd475a6286ee3b8ca57655dbe77b3bbad"
+}

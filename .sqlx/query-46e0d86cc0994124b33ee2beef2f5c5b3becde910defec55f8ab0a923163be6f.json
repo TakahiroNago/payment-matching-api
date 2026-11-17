@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: AliasId\", alias_raw AS alias, alias_normalized AS normalized, source, created_at\n           FROM customer_aliases WHERE customer_id = $1 ORDER BY id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AliasId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "customer_aliases",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "alias",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "customer_aliases",
+            "name": "alias_raw"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "normalized",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "customer_aliases",
+            "name": "alias_normalized"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "customer_aliases",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "customer_aliases",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "46e0d86cc0994124b33ee2beef2f5c5b3becde910defec55f8ab0a923163be6f"
+}
