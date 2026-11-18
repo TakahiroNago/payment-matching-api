@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>入金消込デモ | payment-matching-api</title>
+  <meta name="description" content="請求と銀行入金を突き合わせる入金消込の規則を、ブラウザの中で試せます。">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <p class="eyebrow"><a href="https://github.com/TakahiroNago/payment-matching-api">payment-matching-api</a> のブラウザ内デモ</p>
+      <h1>入金消込デモ</h1>
+      <p class="lead">
+        請求と入金を入力すると、振込名義がどう正規化され、どの規則で、どの請求に消し込まれるか（または、なぜ人の確認待ちになるか）が出ます。
+        入力を変えると、その場で判定し直します。
+      </p>
+      <p class="note">
+        判定はサーバーと同じ Rust のコードを WebAssembly にしたもので、このページの中だけで動きます。入力した内容はどこにも送信されません。データはすべて架空です。
+      </p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section aria-labelledby="h-presets">
+      <h2 id="h-presets">例から始める</h2>
+      <div class="presets" id="presets"></div>
+      <p class="hint" id="preset-note"></p>
+    </section>
+
+    <section aria-labelledby="h-result">
+      <h2 id="h-result">判定結果</h2>
+      <p class="hint">入金は上から順に判定します。自動確定された入金が消し込んだ請求は、後の入金の対象になりません。</p>
+      <p class="summary" id="summary" aria-live="polite"></p>
+      <div id="errors" class="errors" role="alert" hidden></div>
+      <div id="results" class="results"></div>
+    </section>
+
+    <section aria-labelledby="h-input">
+      <h2 id="h-input">入力</h2>
+
+      <h3>取引先</h3>
+      <p class="hint">カナ名が最初の名義になります。支店名つきなど、カナ名と違う名義で振り込まれる場合は別名に入れます（複数は「、」か改行で区切る）。</p>
+      <div class="scroll"><table class="grid" id="customers"></table></div>
+      <button type="button" class="add" data-add="customers">取引先を追加</button>
+
+      <h3>未消込の請求</h3>
+      <div class="scroll"><table class="grid" id="invoices"></table></div>
+      <button type="button" class="add" data-add="invoices">請求を追加</button>
+
+      <h3>入金（銀行明細の順）</h3>
+      <div class="scroll"><table class="grid" id="payments"></table></div>
+      <button type="button" class="add" data-add="payments">入金を追加</button>
+    </section>
+
+    <section aria-labelledby="h-names">
+      <h2 id="h-names">名義の正規化</h2>
+      <p class="hint">半角カナを全角にし、法人格（<code>ｶ)</code>、<code>カブシキガイシャ</code> など）と空白を除き、小書きの仮名を大きくして照合します。照合は完全一致だけです。</p>
+      <div class="scroll"><table class="plain" id="names"></table></div>
+    </section>
+
+    <section aria-labelledby="h-rules">
+      <h2 id="h-rules">規則</h2>
+      <p class="hint">上から順に評価し、最初に成立したものを採用します。自動確定するのは、説明が 1 通りに決まるときだけです。</p>
+      <div class="scroll">
+        <table class="plain">
+          <thead><tr><th>規則</th><th>条件</th><th>説明が 1 通り</th><th>複数</th></tr></thead>
+          <tbody>
+            <tr><td><span class="rule">R1</span> 単一一致</td><td>名義から取引先を特定でき、同額の未消込請求がある</td><td>自動確定</td><td>最も古い請求を候補に</td></tr>
+            <tr><td><span class="rule">R2</span> 合算一致</td><td>取引先を特定でき、未消込請求 2 件以上の合計が入金額に一致する</td><td>自動確定</td><td>古い請求を優先した組み合わせを候補に</td></tr>
+            <tr><td><span class="rule">R3</span> 手数料差引</td><td>手数料を差し引いて支払う取引先で、R1・R2 が「入金額 + 手数料」で成立する</td><td>候補</td><td>候補</td></tr>
+            <tr><td><span class="rule">R4</span> 金額のみ</td><td>取引先を特定できず、同額の未消込請求がある</td><td>候補</td><td>候補</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="hint" id="fees"></p>
+    </section>
+
+    <section aria-labelledby="h-scope">
+      <h2 id="h-scope">このデモにないもの</h2>
+      <p>
+        ここで動くのは、1 回の取り込みの自動判定だけです。データベースを通る部分（同じ明細の二重取り込みの防止、同時に確定したときの排他、候補の確定・却下・手動消込、取消の履歴、再判定）は含みません。
+        それらは API サーバーにあり、<a href="https://github.com/TakahiroNago/payment-matching-api#readme">README</a> とテストで説明しています。
+      </p>
+    </section>
+  </main>
+
+  <footer class="wrap foot">
+    <p><a href="https://github.com/TakahiroNago/payment-matching-api">GitHub: TakahiroNago/payment-matching-api</a>（MIT）</p>
+  </footer>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

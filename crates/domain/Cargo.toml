@@ -1,0 +1,29 @@
+[package]
+name = "payment-matching-domain"
+description = "Payer-name normalization and the matching rules of payment-matching-api. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# What the server needs and the browser demo (wasm32) cannot have:
+# - the ids and amounts as SQL types;
+# - new ids (UUID v7), which need a clock and a random source.
+server = ["dep:sqlx", "uuid/v7"]
+
+[dependencies]
+serde = { workspace = true }
+sqlx = { workspace = true, optional = true }
+time = { workspace = true }
+unicode-normalization = "0.1.26"
+uuid = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

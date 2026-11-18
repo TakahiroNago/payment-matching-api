@@ -39,7 +39,7 @@ jobs:
         run: |
           channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
           test -n "$channel"
-          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
           rustc --version
       - name: The Dockerfile builds with the same Rust
         run: |
@@ -50,7 +50,7 @@ jobs:
         run: cargo fmt --check
       # Offline: every query in the code must have its metadata committed in .sqlx.
       - name: clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
         env:
           SQLX_OFFLINE: "true"
       - name: Install sqlx-cli
@@ -61,7 +61,10 @@ jobs:
       - name: sqlx prepare --check
         run: cargo sqlx prepare --check -- --all-targets
       - name: test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
+      # The browser demo: the rules without the server's dependencies, for wasm32. Published by pages.yml.
+      - name: The demo compiles to WebAssembly
+        run: cargo build -p payment-matching-demo --target wasm32-unknown-unknown --locked
 
   deny:
     name: cargo-deny

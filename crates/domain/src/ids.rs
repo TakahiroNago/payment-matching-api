@@ -6,24 +6,15 @@ use uuid::Uuid;
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(
-            Debug,
-            Clone,
-            Copy,
-            PartialEq,
-            Eq,
-            Hash,
-            PartialOrd,
-            Ord,
-            Serialize,
-            Deserialize,
-            sqlx::Type,
+            Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
         )]
+        #[cfg_attr(feature = "server", derive(sqlx::Type), sqlx(transparent))]
         #[serde(transparent)]
-        #[sqlx(transparent)]
         pub struct $name(pub Uuid);
 
         impl $name {
             /// A new UUID v7: time-ordered, so `ORDER BY id` is creation order.
+            #[cfg(feature = "server")]
             #[must_use]
             pub fn generate() -> Self {
                 Self(Uuid::now_v7())

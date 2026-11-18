@@ -1,4 +1,6 @@
 //! Pure domain logic: nothing here touches the database or the network.
+//!
+//! The `server` feature adds what only the server uses: SQL types and the generation of new ids.
 
 pub mod ids;
 pub mod matching;
