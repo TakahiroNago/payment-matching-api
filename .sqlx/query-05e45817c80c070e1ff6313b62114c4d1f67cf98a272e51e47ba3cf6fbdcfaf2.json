@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH cleared AS (\n               UPDATE invoices SET status = 'cleared' WHERE id = ANY($1) AND status = 'open'\n               RETURNING id\n           ),\n           stale AS (\n               UPDATE matches\n               SET state = 'cancelled', cancelled_at = now(), cancel_reason = 'invoice_cleared'\n               WHERE state = 'suggested'\n                 AND id IN (SELECT match_id FROM match_allocations WHERE invoice_id = ANY($1))\n               RETURNING payment_id\n           ),\n           left_unmatched AS (\n               UPDATE payments SET status = 'unmatched' WHERE id IN (SELECT payment_id FROM stale)\n           )\n           SELECT count(*) AS \"cleared!\" FROM cleared",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cleared!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "05e45817c80c070e1ff6313b62114c4d1f67cf98a272e51e47ba3cf6fbdcfaf2"
+}

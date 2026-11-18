@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id: PaymentId\", batch_id AS \"batch_id: BatchId\", line_no, paid_on,\n                  amount AS \"amount: Yen\", payer_name_raw AS payer_name, payer_name_normalized, status,\n                  decision, created_at\n           FROM payments\n           WHERE ($1::text IS NULL OR status = $1)\n             AND ($2::uuid IS NULL OR id > $2)\n           ORDER BY id\n           LIMIT $3",
+  "query": "SELECT id AS \"id: PaymentId\", batch_id AS \"batch_id: BatchId\", line_no, paid_on,\n                  amount AS \"amount: Yen\", payer_name_raw AS payer_name, payer_name_normalized, status,\n                  decision, decided_at, created_at\n           FROM payments WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -104,6 +104,17 @@
       },
       {
         "ordinal": 9,
+        "name": "decided_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "decided_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -116,9 +127,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Uuid",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -131,8 +140,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "9f03db48f5197d17008960efe8b58f53f72f41f9819b4f2e271bb10369e68082"
+  "hash": "549b1628599a64e0a98243e918096a73636a45f0fd9077a4a9d18b9aaf3b28f0"
 }

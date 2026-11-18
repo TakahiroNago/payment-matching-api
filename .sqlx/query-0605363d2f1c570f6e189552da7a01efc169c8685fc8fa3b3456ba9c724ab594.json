@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id: MatchId\", payment_id AS \"payment_id: PaymentId\", rule, state,\n                  fee_amount AS \"fee_amount: Yen\", created_at, confirmed_at, cancelled_at\n           FROM matches WHERE id = $1",
+  "query": "SELECT id AS \"id: MatchId\", payment_id AS \"payment_id: PaymentId\", rule, state,\n                  fee_amount AS \"fee_amount: Yen\", created_at, confirmed_at, cancelled_at, cancel_reason\n           FROM matches WHERE payment_id = $1 ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -90,6 +90,17 @@
             "name": "cancelled_at"
           }
         }
+      },
+      {
+        "ordinal": 8,
+        "name": "cancel_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "matches",
+            "name": "cancel_reason"
+          }
+        }
       }
     ],
     "parameters": {
@@ -105,8 +116,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "bb95d3bc71c8a9f42a8fc0abf615218d2d7583b3be37f4861f1bbc01c21ae3e9"
+  "hash": "0605363d2f1c570f6e189552da7a01efc169c8685fc8fa3b3456ba9c724ab594"
 }

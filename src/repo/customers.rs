@@ -45,7 +45,7 @@ impl AliasSource {
 }
 
 /// The customer a normalized payer name belongs to.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ResolvedPayer {
     pub customer_id: CustomerId,
     pub fee_deducted: bool,
@@ -134,4 +134,36 @@ pub async fn resolve_payer(
     )
     .fetch_optional(conn)
     .await
+}
+
+/// A normalized payer name and the customer it belongs to.
+pub struct ResolvedName {
+    pub normalized: String,
+    pub payer: ResolvedPayer,
+}
+
+/// The customers behind these normalized payer names. Names that belong to no customer are missing from the
+/// result.
+pub async fn resolve_payers(
+    conn: &mut PgConnection,
+    normalized: &[String],
+) -> sqlx::Result<Vec<ResolvedName>> {
+    let rows = sqlx::query!(
+        r#"SELECT a.alias_normalized, c.id AS "customer_id: CustomerId", c.fee_deducted
+           FROM customer_aliases a JOIN customers c ON c.id = a.customer_id
+           WHERE a.alias_normalized = ANY($1)"#,
+        normalized,
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ResolvedName {
+            normalized: row.alias_normalized,
+            payer: ResolvedPayer {
+                customer_id: row.customer_id,
+                fee_deducted: row.fee_deducted,
+            },
+        })
+        .collect())
 }

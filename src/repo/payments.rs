@@ -15,8 +15,11 @@ pub struct Payment {
     pub payer_name: String,
     pub payer_name_normalized: String,
     pub status: String,
-    /// What the automatic matching decided at import time, and why.
+    /// What the automatic matching decided, and why: at import, or when the payment was last decided again.
     pub decision: serde_json::Value,
+    /// When `decision` was made.
+    #[serde(with = "time::serde::rfc3339")]
+    pub decided_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -115,30 +118,82 @@ pub async fn find_batch_by_hash(
 
 pub struct NewPayment<'a> {
     pub id: PaymentId,
-    pub batch_id: BatchId,
     pub line_no: i32,
     pub paid_on: Date,
     pub amount: Yen,
     pub payer_name_raw: &'a str,
     pub payer_name_normalized: &'a str,
-    pub status: PaymentStatus,
-    pub decision: serde_json::Value,
 }
 
-pub async fn insert(conn: &mut PgConnection, new: &NewPayment<'_>) -> sqlx::Result<()> {
+/// Inserts the payments of a batch in one statement, as unmatched and without a decision. The caller decides
+/// about each of them and calls [`set_decisions`] before the transaction ends.
+pub async fn insert_many(
+    conn: &mut PgConnection,
+    batch_id: BatchId,
+    new: &[NewPayment<'_>],
+) -> sqlx::Result<()> {
+    let ids: Vec<uuid::Uuid> = new.iter().map(|p| p.id.0).collect();
+    let line_nos: Vec<i32> = new.iter().map(|p| p.line_no).collect();
+    let paid_on: Vec<Date> = new.iter().map(|p| p.paid_on).collect();
+    let amounts: Vec<i64> = new.iter().map(|p| p.amount.0).collect();
+    let raw: Vec<String> = new.iter().map(|p| p.payer_name_raw.to_owned()).collect();
+    let normalized: Vec<String> = new
+        .iter()
+        .map(|p| p.payer_name_normalized.to_owned())
+        .collect();
     sqlx::query!(
         "INSERT INTO payments
             (id, batch_id, line_no, paid_on, amount, payer_name_raw, payer_name_normalized, status, decision)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        new.id.0,
-        new.batch_id.0,
-        new.line_no,
-        new.paid_on,
-        new.amount.0,
-        new.payer_name_raw,
-        new.payer_name_normalized,
-        new.status.as_str(),
-        new.decision,
+         SELECT id, $1, line_no, paid_on, amount, raw, normalized, 'unmatched', 'null'::jsonb
+         FROM UNNEST($2::uuid[], $3::int4[], $4::date[], $5::bigint[], $6::text[], $7::text[])
+              AS line (id, line_no, paid_on, amount, raw, normalized)",
+        batch_id.0,
+        &ids,
+        &line_nos,
+        &paid_on,
+        &amounts,
+        &raw,
+        &normalized,
+    )
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// The automatic decision about a payment.
+pub struct Decided {
+    pub id: PaymentId,
+    /// Empty when the payer name could not be normalized.
+    pub payer_name_normalized: String,
+    pub decision: serde_json::Value,
+}
+
+/// Stores the automatic decisions about these payments, in one statement.
+///
+/// The status is not taken from the decision but from the match the payment has now: a suggestion recorded
+/// for one payment may have been cancelled since, by a later payment that cleared its invoice.
+pub async fn set_decisions(conn: &mut PgConnection, decided: &[Decided]) -> sqlx::Result<()> {
+    let ids: Vec<uuid::Uuid> = decided.iter().map(|d| d.id.0).collect();
+    let normalized: Vec<String> = decided
+        .iter()
+        .map(|d| d.payer_name_normalized.clone())
+        .collect();
+    let decisions: Vec<serde_json::Value> = decided.iter().map(|d| d.decision.clone()).collect();
+    sqlx::query!(
+        "UPDATE payments p
+         SET payer_name_normalized = d.normalized,
+             decision = d.decision,
+             decided_at = now(),
+             status = COALESCE(
+                 (SELECT CASE m.state WHEN 'confirmed' THEN 'matched' ELSE 'suggested' END
+                  FROM matches m
+                  WHERE m.payment_id = p.id AND m.state <> 'cancelled'),
+                 'unmatched')
+         FROM UNNEST($1::uuid[], $2::text[], $3::jsonb[]) AS d (id, normalized, decision)
+         WHERE p.id = d.id",
+        &ids,
+        &normalized,
+        &decisions,
     )
     .execute(conn)
     .await?;
@@ -160,12 +215,49 @@ pub async fn set_status(
     Ok(())
 }
 
+/// Unmatched payments after `after`, oldest first.
+pub async fn unmatched_after(
+    conn: &mut PgConnection,
+    after: Option<PaymentId>,
+    limit: i64,
+) -> sqlx::Result<Vec<Payment>> {
+    sqlx::query_as!(
+        Payment,
+        r#"SELECT id AS "id: PaymentId", batch_id AS "batch_id: BatchId", line_no, paid_on,
+                  amount AS "amount: Yen", payer_name_raw AS payer_name, payer_name_normalized, status,
+                  decision, decided_at, created_at
+           FROM payments
+           WHERE status = 'unmatched' AND ($1::uuid IS NULL OR id > $1)
+           ORDER BY id
+           LIMIT $2"#,
+        after.map(|id| id.0),
+        limit,
+    )
+    .fetch_all(conn)
+    .await
+}
+
+/// The payments with these ids, oldest first.
+pub async fn by_ids(conn: &mut PgConnection, ids: &[PaymentId]) -> sqlx::Result<Vec<Payment>> {
+    let ids: Vec<uuid::Uuid> = ids.iter().map(|id| id.0).collect();
+    sqlx::query_as!(
+        Payment,
+        r#"SELECT id AS "id: PaymentId", batch_id AS "batch_id: BatchId", line_no, paid_on,
+                  amount AS "amount: Yen", payer_name_raw AS payer_name, payer_name_normalized, status,
+                  decision, decided_at, created_at
+           FROM payments WHERE id = ANY($1) ORDER BY id"#,
+        &ids,
+    )
+    .fetch_all(conn)
+    .await
+}
+
 pub async fn find(conn: &mut PgConnection, id: PaymentId) -> sqlx::Result<Option<Payment>> {
     sqlx::query_as!(
         Payment,
         r#"SELECT id AS "id: PaymentId", batch_id AS "batch_id: BatchId", line_no, paid_on,
                   amount AS "amount: Yen", payer_name_raw AS payer_name, payer_name_normalized, status,
-                  decision, created_at
+                  decision, decided_at, created_at
            FROM payments WHERE id = $1"#,
         id.0,
     )
@@ -178,7 +270,7 @@ pub async fn of_batch(conn: &mut PgConnection, batch_id: BatchId) -> sqlx::Resul
         Payment,
         r#"SELECT id AS "id: PaymentId", batch_id AS "batch_id: BatchId", line_no, paid_on,
                   amount AS "amount: Yen", payer_name_raw AS payer_name, payer_name_normalized, status,
-                  decision, created_at
+                  decision, decided_at, created_at
            FROM payments WHERE batch_id = $1 ORDER BY line_no"#,
         batch_id.0,
     )
@@ -198,7 +290,7 @@ pub async fn list(conn: &mut PgConnection, filter: &ListFilter<'_>) -> sqlx::Res
         Payment,
         r#"SELECT id AS "id: PaymentId", batch_id AS "batch_id: BatchId", line_no, paid_on,
                   amount AS "amount: Yen", payer_name_raw AS payer_name, payer_name_normalized, status,
-                  decision, created_at
+                  decision, decided_at, created_at
            FROM payments
            WHERE ($1::text IS NULL OR status = $1)
              AND ($2::uuid IS NULL OR id > $2)

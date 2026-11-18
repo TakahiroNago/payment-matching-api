@@ -20,6 +20,7 @@
 | GET | `/v1/invoices/{id}` | 請求と、それを消し込んだ消込 | 200 |
 | POST | `/v1/payment-batches` | 入金の取り込みと自動突合 | 201（再送は 200） |
 | GET | `/v1/payments` | 入金の一覧 | 200 |
+| POST | `/v1/payments/rematch` | 未消込の入金の再判定 | 200 |
 | GET | `/v1/payments/{id}` | 入金と、その消込の履歴 | 200 |
 | POST | `/v1/payments/{id}/matches` | 手動消込 | 201 |
 | POST | `/v1/matches/{id}/confirm` | 候補の確定 | 200 |
@@ -178,7 +179,7 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
     { "id": "019a…", "batch_id": "019a…", "line_no": 1, "paid_on": "2026-11-10", "amount": 110000,
       "payer_name": "ｶ)ﾔﾏﾀﾞｼﾖｳｼﾞ", "payer_name_normalized": "ヤマダシヨウジ", "status": "matched",
       "decision": { "outcome": "auto_confirmed", "rule": "R1", "invoice_ids": ["019a…"], "fee_amount": 0 },
-      "created_at": "2026-11-18T03:00:00.123456Z" }
+      "decided_at": "2026-11-18T03:00:00.123456Z", "created_at": "2026-11-18T03:00:00.123456Z" }
   ]
 }
 ```
@@ -209,7 +210,33 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 
 `subset_search_skipped` が `true` のときは、取引先の未消込請求が 20 件を超えていて、組み合わせの探索を行っていません。
 
-`decision` は取り込み時点の自動判定の記録で、その後の確定・取消では変わりません。現在の状態は `status` と `matches` で見ます。
+`decision` は自動判定の記録で、その後の確定・取消では変わりません。変わるのは再判定（`POST /v1/payments/rematch`）のときだけで、`decided_at` がその判定の時刻です（取り込み時の判定のままなら `created_at` と同じ）。現在の状態は `status` と `matches` で見ます。
+
+同じバッチの後の行が請求を消し込んだために、前の行の候補が取消になることがあります。その行は `decision.outcome` が `suggested` のまま、`status` は `unmatched` になります。
+
+### `POST /v1/payments/rematch`
+
+`unmatched` の入金を、いま登録されている別名と未消込の請求に対して判定し直します。別名を登録した後、請求を後から登録した後、候補が取消になった後に使います。規則は取り込みと同じで、説明が 1 通りなら自動確定、複数なら候補になります。本文は不要です。
+
+| クエリ | 内容 |
+|---|---|
+| `limit` | 1 回に見る入金の数。1〜200、既定 50 |
+| `cursor` | 前回の `next_cursor`。続きの入金を見る |
+
+```json
+{
+  "summary": { "total": 3, "matched": 1, "suggested": 1, "unmatched": 1 },
+  "items": [ { "id": "019a…", "status": "matched", "decision": { "outcome": "auto_confirmed", "rule": "R1", "…": "…" },
+               "decided_at": "2026-11-18T04:00:00.123456Z", "…": "…" } ],
+  "next_cursor": null
+}
+```
+
+- `summary.total` は見た入金の数、残りはその結果です。`items` は `unmatched` でなくなった入金（古い順）。
+- 入金は古い順に判定し、前の入金が消し込んだ請求は後の入金の対象になりません。見た入金は、結果が変わらなくても `decision` と `decided_at` が更新されます。
+- `next_cursor` が `null` でなければ、まだ見ていない `unmatched` の入金があります。
+- `suggested` の入金は対象外です。却下（取消）すれば `unmatched` になり、次の再判定で見られます。
+- 1 回の呼び出しは 1 トランザクションで、失敗したら何も変わりません。
 
 ### `GET /v1/payments`
 
@@ -224,16 +251,27 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
   "id": "019a…", "status": "matched", "amount": 109560, "payer_name": "ﾔﾏﾀﾞｼﾖｳｼﾞ", "…": "…",
   "decision": { "outcome": "suggested", "rule": "R3", "invoice_ids": ["019a…"], "fee_amount": 440,
                 "reason": { "kind": "fee_deducted" } },
+  "decided_at": "2026-11-18T03:00:00.123456Z",
   "matches": [
     { "id": "019a…", "rule": "R3", "state": "confirmed", "fee_amount": 440,
       "created_at": "2026-11-18T03:00:00.123456Z", "confirmed_at": "2026-11-18T03:05:00.123456Z",
-      "cancelled_at": null,
+      "cancelled_at": null, "cancel_reason": null,
       "allocations": [
         { "invoice_id": "019a…", "invoice_number": "INV-2026-001", "invoice_amount": 110000, "amount": 109560 }
       ] }
   ]
 }
 ```
+
+`matches[].cancel_reason` は取消になった消込の理由です。
+
+| `cancel_reason` | 意味 |
+|---|---|
+| `dismissed` | 人が候補を却下した |
+| `reversed` | 人が確定済みの消込を取り消した |
+| `replaced` | 人が候補を確定せず、手動消込をした |
+| `invoice_cleared` | 候補の請求が、他の入金で消し込まれた（確定できなくなったので自動で取消） |
+| `null` | 取消されていない。または、理由を記録する前に取消された |
 
 `allocations[].amount` はその請求に充てた入金額で、合計が入金額になります。手数料は支払期日が最も古い請求から引かれます（`invoice_amount - amount` が手数料）。
 
@@ -251,7 +289,7 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 
 `register_alias` を `true` にすると、入金の名義をその取引先の別名（`source: "learned"`）として登録し、次回から名義で特定できるようにします。
 
-請求が消し込まれると（確定・手動消込・取り込み時の自動確定のどれでも）、同じ請求を含む他の入金の候補は取消になり、その入金は `unmatched` に戻ります。確定できなくなった候補を残さないためです。
+請求が消し込まれると（確定・手動消込・自動確定のどれでも）、同じ請求を含む他の入金の候補は取消になり（`cancel_reason: "invoice_cleared"`）、その入金は `unmatched` に戻ります。確定できなくなった候補を残さないためです。戻った入金は `POST /v1/payments/rematch` で判定し直せます。
 
 - 409：消込が `suggested` でない。請求が既に消込済み。`register_alias` の名義が別の取引先のもの。
 - 422 `register_alias: payer_name_not_normalizable`：入金に、別名にできる名義がない。

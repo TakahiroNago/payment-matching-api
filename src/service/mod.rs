@@ -1,7 +1,9 @@
 //! Use cases: each public function is one transaction.
 
+mod auto;
 pub mod import;
 pub mod matching;
+pub mod rematch;
 
 use serde::Serialize;
 use sqlx::PgConnection;
@@ -33,6 +35,8 @@ pub struct MatchDetail {
     pub confirmed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub cancelled_at: Option<OffsetDateTime>,
+    /// Why the match was cancelled: `dismissed`, `reversed`, `replaced` or `invoice_cleared`.
+    pub cancel_reason: Option<String>,
     pub allocations: Vec<Allocation>,
 }
 
@@ -54,6 +58,7 @@ pub async fn payment_detail(
             created_at: m.created_at,
             confirmed_at: m.confirmed_at,
             cancelled_at: m.cancelled_at,
+            cancel_reason: m.cancel_reason,
             allocations,
         });
     }
