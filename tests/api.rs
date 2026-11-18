@@ -1887,3 +1887,474 @@ async fn payments_are_listed_by_status(pool: PgPool) {
         [ids[2].clone()]
     );
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Consistency of payments, matches and invoices
+// ---------------------------------------------------------------------------------------------------------
+
+/// What must hold between `payments`, `matches`, `match_allocations` and `invoices` after every request,
+/// whatever the requests were. Each query selects the rows that break one rule.
+const CONSISTENCY_RULES: [(&str, &str); 7] = [
+    (
+        "I1: a payment has at most one match that is not cancelled",
+        "SELECT payment_id::text FROM matches WHERE state <> 'cancelled' GROUP BY payment_id HAVING count(*) > 1",
+    ),
+    (
+        "the status of a payment is that of its match: confirmed -> matched, suggested -> suggested, \
+         none -> unmatched",
+        "SELECT p.id::text || ' is ' || p.status
+           FROM payments p
+          WHERE p.status <> COALESCE(
+                    (SELECT min(CASE m.state WHEN 'confirmed' THEN 'matched' ELSE 'suggested' END)
+                       FROM matches m
+                      WHERE m.payment_id = p.id AND m.state <> 'cancelled'),
+                    'unmatched')",
+    ),
+    (
+        "I2: a cleared invoice is in exactly one confirmed match, an open invoice in none",
+        "SELECT i.id::text || ' is ' || i.status || ' with ' || count(m.id) || ' confirmed matches'
+           FROM invoices i
+           LEFT JOIN match_allocations a ON a.invoice_id = i.id
+           LEFT JOIN matches m ON m.id = a.match_id AND m.state = 'confirmed'
+          GROUP BY i.id
+         HAVING count(m.id) <> CASE i.status WHEN 'cleared' THEN 1 ELSE 0 END",
+    ),
+    (
+        "I3: a match that is not cancelled allocates the whole payment, and with the fee the whole of its \
+         invoices",
+        "SELECT m.id::text || ' allocates ' || COALESCE(sum(a.amount), 0) || ' of payment ' || p.amount
+                || ', fee ' || m.fee_amount || ', invoices ' || COALESCE(sum(i.amount), 0)
+           FROM matches m
+           JOIN payments p ON p.id = m.payment_id
+           LEFT JOIN match_allocations a ON a.match_id = m.id
+           LEFT JOIN invoices i ON i.id = a.invoice_id
+          WHERE m.state <> 'cancelled'
+          GROUP BY m.id, p.amount
+         HAVING COALESCE(sum(a.amount), 0) <> p.amount
+             OR COALESCE(sum(a.amount), 0) + m.fee_amount <> COALESCE(sum(i.amount), 0)",
+    ),
+    (
+        "I5: a suggestion names open invoices only",
+        "SELECT m.id::text || ' names ' || i.id::text
+           FROM matches m
+           JOIN match_allocations a ON a.match_id = m.id
+           JOIN invoices i ON i.id = a.invoice_id
+          WHERE m.state = 'suggested' AND i.status <> 'open'",
+    ),
+    (
+        "the invoices of a match belong to one customer",
+        "SELECT a.match_id::text
+           FROM match_allocations a
+           JOIN invoices i ON i.id = a.invoice_id
+          GROUP BY a.match_id
+         HAVING count(DISTINCT i.customer_id) > 1",
+    ),
+    (
+        "the timestamps and the reason of a match follow its state",
+        "SELECT id::text || ' is ' || state
+           FROM matches
+          WHERE (state = 'confirmed') AND confirmed_at IS NULL
+             OR (state = 'suggested') AND confirmed_at IS NOT NULL
+             OR (state = 'cancelled') <> (cancelled_at IS NOT NULL)
+             OR (state = 'cancelled') <> (cancel_reason IS NOT NULL)",
+    ),
+];
+
+/// The rules that are broken, each with the rows that break it. Empty when the data is consistent.
+async fn inconsistencies(conn: &mut sqlx::PgConnection) -> Vec<String> {
+    let mut found = Vec::new();
+    for (rule, sql) in CONSISTENCY_RULES {
+        let rows: Vec<String> = sqlx::query_scalar(sql).fetch_all(&mut *conn).await.unwrap();
+        if !rows.is_empty() {
+            found.push(format!("{rule}: {}", rows.join(", ")));
+        }
+    }
+    found
+}
+
+/// A small deterministic generator, so a failing run can be repeated from its seed.
+struct Dice(u64);
+
+impl Dice {
+    fn roll(&mut self, sides: usize) -> usize {
+        // SplitMix64.
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        usize::try_from(z % u64::try_from(sides).unwrap()).unwrap()
+    }
+
+    fn pick<T: Copy>(&mut self, from: &[T]) -> T {
+        from[self.roll(from.len())]
+    }
+}
+
+/// Few amounts and few payers, so that payments compete for the same invoices: several invoices of one
+/// amount, payments short by a fee, payments that pay two invoices at once.
+const AMOUNTS: [i64; 3] = [11_000, 22_000, 33_000];
+const PAYERS: [&str; 5] = ["ﾔﾏﾀﾞｼﾖｳｼﾞ", "ｽｽﾞｷｺｳｷﾞﾖｳ", "ﾀﾅｶｻﾝｷﾞﾖｳ", "ﾔﾏﾀﾞ ｵｵｻｶｼﾃﾝ", "ﾌﾒｲ"];
+
+/// Runs `steps` requests chosen by the seed and checks the rules after each of them. Returns how many
+/// requests of each kind succeeded, and the states that the rules got to see (`table.column=value`).
+async fn run_random_requests(
+    api: &Api,
+    seed: u64,
+    steps: usize,
+) -> ([usize; 7], std::collections::BTreeSet<String>) {
+    let mut dice = Dice(seed);
+    let mut customers = Vec::new();
+    for (name, kana, fee_deducted) in [
+        ("株式会社山田商事", "ヤマダショウジ", false),
+        ("鈴木工業株式会社", "スズキコウギョウ", true),
+        ("田中産業株式会社", "タナカサンギョウ", true),
+    ] {
+        customers.push(api.customer(name, kana, fee_deducted).await);
+    }
+    let mut succeeded = [0; 7];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut log: Vec<String> = Vec::new();
+
+    for step in 0..steps {
+        let kind = dice.pick(&[0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6]);
+        let (what, ok) = match kind {
+            // Import one to four lines.
+            0 => {
+                let lines: Vec<(&str, i64)> = (0..=dice.roll(4))
+                    .map(|_| {
+                        let amount = match dice.roll(4) {
+                            0 => dice.pick(&AMOUNTS) - 440,
+                            1 => dice.pick(&AMOUNTS) + dice.pick(&AMOUNTS),
+                            _ => dice.pick(&AMOUNTS),
+                        };
+                        (dice.pick(&PAYERS), amount)
+                    })
+                    .collect();
+                let reply = api
+                    .import(&format!("seed-{seed}-step-{step}"), &lines)
+                    .await;
+                // The same lines under a new key are refused as a duplicate; nothing else may fail.
+                assert!(
+                    reply.status == StatusCode::CREATED || reply.status == StatusCode::CONFLICT,
+                    "{}",
+                    reply.body
+                );
+                (
+                    format!("import {lines:?}"),
+                    reply.status == StatusCode::CREATED,
+                )
+            }
+            // Register an invoice.
+            1 => {
+                let customer = dice.pick(&[0, 1, 2]);
+                let amount = dice.pick(&AMOUNTS);
+                let due = dice.pick(&["2026-10-31", "2026-11-30", "2026-12-31"]);
+                api.invoice(&customers[customer], &format!("INV-{step:04}"), amount, due)
+                    .await;
+                (format!("invoice of {amount} for customer {customer}"), true)
+            }
+            // Confirm a suggestion; every other time, learn the payer name with it.
+            2 => {
+                let suggested: Vec<String> = sqlx::query_scalar(
+                    "SELECT id::text FROM matches WHERE state = 'suggested' ORDER BY id",
+                )
+                .fetch_all(&api.pool)
+                .await
+                .unwrap();
+                if suggested.is_empty() {
+                    ("confirm (nothing suggested)".to_owned(), false)
+                } else {
+                    let id = &suggested[dice.roll(suggested.len())];
+                    let path = format!("/v1/matches/{id}/confirm");
+                    let reply = if dice.roll(2) == 0 {
+                        api.post(&path, json!({ "register_alias": true })).await
+                    } else {
+                        api.post_empty(&path).await
+                    };
+                    // Learning a name that already belongs to another customer is refused.
+                    assert!(
+                        reply.status == StatusCode::OK || reply.status == StatusCode::CONFLICT,
+                        "{}",
+                        reply.body
+                    );
+                    (format!("confirm {id}"), reply.status == StatusCode::OK)
+                }
+            }
+            // Cancel a match, confirmed or suggested.
+            3 => {
+                let active: Vec<String> = sqlx::query_scalar(
+                    "SELECT id::text FROM matches WHERE state <> 'cancelled' ORDER BY id",
+                )
+                .fetch_all(&api.pool)
+                .await
+                .unwrap();
+                if active.is_empty() {
+                    ("cancel (no match)".to_owned(), false)
+                } else {
+                    let id = &active[dice.roll(active.len())];
+                    let reply = api.post_empty(&format!("/v1/matches/{id}/cancel")).await;
+                    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+                    (format!("cancel {id}"), true)
+                }
+            }
+            // Match by hand a payment that is not matched, to an open invoice that explains it with or
+            // without a fee. One time in four the invoice is any open one, which is usually refused.
+            4 => {
+                let careless = dice.roll(4) == 0;
+                let pairs: Vec<(String, String, i64)> = sqlx::query_as(
+                    "SELECT p.id::text, i.id::text, i.amount - p.amount
+                       FROM payments p
+                       JOIN invoices i ON i.status = 'open' AND ($1 OR i.amount - p.amount IN (0, 440))
+                      WHERE p.status <> 'matched'
+                      ORDER BY p.id, i.id",
+                )
+                .bind(careless)
+                .fetch_all(&api.pool)
+                .await
+                .unwrap();
+                if pairs.is_empty() {
+                    ("manual match (nothing fits)".to_owned(), false)
+                } else {
+                    let (payment, invoice, fee) = &pairs[dice.roll(pairs.len())];
+                    let reply = api
+                        .post(
+                            &format!("/v1/payments/{payment}/matches"),
+                            json!({ "invoice_ids": [invoice], "fee_amount": (*fee).max(0) }),
+                        )
+                        .await;
+                    assert!(
+                        reply.status == StatusCode::CREATED
+                            || reply.status == StatusCode::UNPROCESSABLE_ENTITY,
+                        "{}",
+                        reply.body
+                    );
+                    assert!(
+                        careless || reply.status == StatusCode::CREATED,
+                        "{}",
+                        reply.body
+                    );
+                    (
+                        format!("manual match of {payment} to {invoice}, fee {fee}"),
+                        reply.status == StatusCode::CREATED,
+                    )
+                }
+            }
+            // Decide the unmatched payments again, a few at a time.
+            5 => {
+                let limit = 1 + dice.roll(5);
+                let reply = api
+                    .post_empty(&format!("/v1/payments/rematch?limit={limit}"))
+                    .await;
+                assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+                let changed = reply.body["items"].as_array().unwrap().len();
+                (
+                    format!("rematch of {limit}, {changed} changed"),
+                    changed > 0,
+                )
+            }
+            // Teach the branch name to a customer. Refused once another customer has it.
+            _ => {
+                let customer = dice.pick(&[0, 1, 2]);
+                let reply = api
+                    .post(
+                        &format!("/v1/customers/{}/aliases", customers[customer]),
+                        json!({ "alias": "ﾔﾏﾀﾞ ｵｵｻｶｼﾃﾝ" }),
+                    )
+                    .await;
+                assert!(
+                    reply.status == StatusCode::CREATED
+                        || reply.status == StatusCode::OK
+                        || reply.status == StatusCode::CONFLICT,
+                    "{}",
+                    reply.body
+                );
+                (
+                    format!("alias for customer {customer}"),
+                    reply.status != StatusCode::CONFLICT,
+                )
+            }
+        };
+        succeeded[kind] += usize::from(ok);
+        log.push(format!("{step}: {what}"));
+
+        let mut conn = api.pool.acquire().await.unwrap();
+        let broken = inconsistencies(&mut conn).await;
+        assert!(
+            broken.is_empty(),
+            "seed {seed}: inconsistent after step {step}\n{}\nrequests so far:\n{}",
+            broken.join("\n"),
+            log.join("\n")
+        );
+        let states: Vec<String> = sqlx::query_scalar(
+            "SELECT 'payments.status=' || status FROM payments
+             UNION SELECT 'matches.state=' || state FROM matches
+             UNION SELECT 'matches.cancel_reason=' || cancel_reason FROM matches WHERE state = 'cancelled'
+             UNION SELECT 'invoices.status=' || status FROM invoices",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        seen.extend(states);
+    }
+    (succeeded, seen)
+}
+
+#[sqlx::test]
+async fn any_sequence_of_requests_leaves_payments_matches_and_invoices_consistent(pool: PgPool) {
+    let api = Api::new(pool);
+    let (succeeded, seen) = run_random_requests(&api, 20_261_118, 250).await;
+
+    // The run is worth something only if every kind of request did change the data.
+    for (kind, count) in [
+        "import",
+        "invoice",
+        "confirm",
+        "cancel",
+        "manual match",
+        "rematch",
+        "alias",
+    ]
+    .iter()
+    .zip(succeeded)
+    {
+        assert!(count > 0, "no {kind} succeeded: {succeeded:?}");
+    }
+    // And only if the rules got to see every state.
+    for state in [
+        "payments.status=unmatched",
+        "payments.status=suggested",
+        "payments.status=matched",
+        "matches.state=suggested",
+        "matches.state=confirmed",
+        "matches.state=cancelled",
+        "matches.cancel_reason=dismissed",
+        "matches.cancel_reason=reversed",
+        "matches.cancel_reason=replaced",
+        "matches.cancel_reason=invoice_cleared",
+        "invoices.status=open",
+        "invoices.status=cleared",
+    ] {
+        assert!(seen.contains(state), "never seen: {state}");
+    }
+}
+
+#[sqlx::test]
+async fn other_sequences_of_requests_are_consistent_too(pool: PgPool) {
+    let api = Api::new(pool);
+    // A second seed, in its own database. Change the number to try other sequences.
+    run_random_requests(&api, 7, 250).await;
+}
+
+#[sqlx::test]
+async fn the_consistency_rules_notice_damaged_data(pool: PgPool) {
+    let api = Api::new(pool);
+    let customer = api
+        .customer("株式会社山田商事", "ヤマダショウジ", false)
+        .await;
+    api.invoice(&customer, "INV-001", 110_000, "2026-10-31")
+        .await;
+    api.invoice(&customer, "INV-002", 55_000, "2026-10-31")
+        .await;
+    api.invoice(&customer, "INV-003", 55_000, "2026-11-30")
+        .await;
+    // One confirmed match, one suggestion, and a cancelled suggestion with an unmatched payment.
+    let imported = api
+        .import(
+            "damage",
+            &[
+                ("ﾔﾏﾀﾞｼﾖｳｼﾞ", 110_000),
+                ("ﾔﾏﾀﾞｼﾖｳｼﾞ", 55_000),
+                ("ﾔﾏﾀﾞｼﾖｳｼﾞ", 55_000),
+            ],
+        )
+        .await;
+    assert_eq!(
+        imported.body["summary"],
+        json!({ "total": 3, "matched": 1, "suggested": 2, "unmatched": 0 })
+    );
+    let last = api
+        .get(&format!(
+            "/v1/payments/{}",
+            id_of(&imported.body["payments"][2])
+        ))
+        .await;
+    let dismissed = api
+        .post_empty(&format!(
+            "/v1/matches/{}/cancel",
+            active_match_id(&last.body)
+        ))
+        .await;
+    assert_eq!(dismissed.status, StatusCode::OK);
+
+    let mut conn = api.pool.acquire().await.unwrap();
+    assert_eq!(inconsistencies(&mut conn).await, Vec::<String>::new());
+
+    // Each change is one a bug could make; each is rolled back before the next.
+    let damage = [
+        (
+            "UPDATE payments SET status = 'unmatched' WHERE status = 'matched'",
+            "the status of a payment",
+        ),
+        (
+            "UPDATE payments SET status = 'suggested' WHERE status = 'unmatched'",
+            "the status of a payment",
+        ),
+        (
+            "UPDATE matches SET state = 'confirmed', confirmed_at = now() WHERE state = 'suggested'",
+            "the status of a payment",
+        ),
+        (
+            "UPDATE invoices SET status = 'open' WHERE status = 'cleared'",
+            "I2",
+        ),
+        (
+            "UPDATE invoices SET status = 'cleared' WHERE invoice_number = 'INV-003'",
+            "I2",
+        ),
+        (
+            "UPDATE invoices SET status = 'cleared' WHERE invoice_number = 'INV-002'",
+            "I5",
+        ),
+        (
+            "UPDATE matches SET fee_amount = fee_amount + 1 WHERE state = 'confirmed'",
+            "I3",
+        ),
+        (
+            "UPDATE match_allocations a SET amount = a.amount - 1 FROM matches m
+              WHERE m.id = a.match_id AND m.state = 'suggested'",
+            "I3",
+        ),
+        (
+            "DELETE FROM match_allocations a USING matches m WHERE m.id = a.match_id AND m.state = 'confirmed'",
+            "I3",
+        ),
+        (
+            "UPDATE matches SET cancelled_at = now() WHERE state = 'confirmed'",
+            "the timestamps",
+        ),
+        (
+            "UPDATE matches SET cancel_reason = NULL WHERE state = 'cancelled'",
+            "the timestamps",
+        ),
+        (
+            "UPDATE matches SET confirmed_at = NULL WHERE state = 'confirmed'",
+            "the timestamps",
+        ),
+    ];
+    for (sql, rule) in damage {
+        let mut tx = api.pool.begin().await.unwrap();
+        let changed = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert!(changed > 0, "changed nothing: {sql}");
+        let broken = inconsistencies(&mut tx).await;
+        assert!(
+            broken.iter().any(|found| found.starts_with(rule)),
+            "{sql}\nwas expected to break \"{rule}\", but the rules found: {broken:?}"
+        );
+        tx.rollback().await.unwrap();
+    }
+}
