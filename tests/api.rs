@@ -1016,9 +1016,9 @@ async fn concurrent_imports_with_one_key_create_one_batch(pool: PgPool) {
 
 #[sqlx::test]
 async fn a_failed_import_leaves_nothing_behind(pool: PgPool) {
-    // A constraint that exists only in this test's database makes the second line fail in the middle of the
-    // transaction, after the first line has been matched.
-    sqlx::query("ALTER TABLE payments ADD CONSTRAINT test_reject CHECK (amount <> 666)")
+    // A constraint that exists only in this test's database makes the match of the second line fail in the
+    // middle of the transaction, after the payments have been inserted and the first line has been matched.
+    sqlx::query("ALTER TABLE match_allocations ADD CONSTRAINT test_reject CHECK (amount <> 666)")
         .execute(&pool)
         .await
         .unwrap();
@@ -1029,6 +1029,7 @@ async fn a_failed_import_leaves_nothing_behind(pool: PgPool) {
     let invoice = api
         .invoice(&customer, "INV-001", 110_000, "2026-11-30")
         .await;
+    api.invoice(&customer, "INV-002", 666, "2026-11-30").await;
 
     let reply = api
         .import("fails", &[("ﾔﾏﾀﾞｼﾖｳｼﾞ", 110_000), ("ﾔﾏﾀﾞｼﾖｳｼﾞ", 666)])
@@ -1154,6 +1155,7 @@ async fn clearing_an_invoice_cancels_the_suggestions_of_other_payments_that_name
     assert_eq!(stale["status"], "unmatched");
     assert_eq!(stale["matches"][0]["id"], stale_match.as_str());
     assert_eq!(stale["matches"][0]["state"], "cancelled");
+    assert_eq!(stale["matches"][0]["cancel_reason"], "invoice_cleared");
     assert_problem(
         &api.post_empty(&format!("/v1/matches/{stale_match}/confirm"))
             .await,
@@ -1285,6 +1287,7 @@ async fn cancelling_a_confirmed_match_reopens_the_invoice_and_keeps_the_history(
     assert_eq!(cancelled.status, StatusCode::OK, "{}", cancelled.body);
     assert_eq!(cancelled.body["status"], "unmatched");
     assert_eq!(cancelled.body["matches"][0]["state"], "cancelled");
+    assert_eq!(cancelled.body["matches"][0]["cancel_reason"], "reversed");
     assert!(cancelled.body["matches"][0]["cancelled_at"].is_string());
     assert_eq!(
         cancelled.body["matches"][0]["allocations"][0]["invoice_id"],
@@ -1341,6 +1344,7 @@ async fn dismissing_a_suggestion_leaves_the_payment_unmatched(pool: PgPool) {
         .await;
     assert_eq!(dismissed.status, StatusCode::OK);
     assert_eq!(dismissed.body["status"], "unmatched");
+    assert_eq!(dismissed.body["matches"][0]["cancel_reason"], "dismissed");
     assert_eq!(api.invoice_status(&invoice).await, "open");
     assert_problem(
         &api.post_empty(&format!("/v1/matches/{match_id}/confirm"))
@@ -1445,7 +1449,9 @@ async fn manual_match_cancels_an_open_suggestion(pool: PgPool) {
     assert_eq!(manual.status, StatusCode::CREATED, "{}", manual.body);
     let history = manual.body["matches"].as_array().unwrap();
     assert_eq!(history[0]["state"], "cancelled");
+    assert_eq!(history[0]["cancel_reason"], "replaced");
     assert_eq!(history[1]["state"], "confirmed");
+    assert_eq!(history[1]["cancel_reason"], Value::Null);
     assert_eq!(api.invoice_status(&older).await, "open");
     assert_eq!(api.invoice_status(&newer).await, "cleared");
 }
@@ -1608,6 +1614,212 @@ async fn learning_an_alias_that_belongs_to_another_customer_is_refused(pool: PgP
     assert_eq!(
         reply.body["errors"],
         json!([{ "field": "register_alias", "code": "payer_name_not_normalizable" }])
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Deciding again
+// ---------------------------------------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn unmatched_payments_are_decided_again(pool: PgPool) {
+    let api = Api::new(pool);
+    let customer = api
+        .customer("株式会社山田商事", "ヤマダショウジ", false)
+        .await;
+
+    // Nothing to match against yet: the branch name is unknown, and no invoice has these amounts.
+    let imported = api
+        .import(
+            "day-1",
+            &[("ﾔﾏﾀﾞ ｵｵｻｶｼﾃﾝ", 99_000), ("ﾔﾏﾀﾞｼﾖｳｼﾞ", 77_000), ("ﾌﾒｲ", 5_000)],
+        )
+        .await;
+    assert_eq!(imported.body["summary"]["unmatched"], 3);
+    let ids: Vec<String> = imported.body["payments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(id_of)
+        .collect();
+    assert_eq!(
+        imported.body["payments"][0]["decided_at"],
+        imported.body["payments"][0]["created_at"]
+    );
+
+    // Deciding again changes nothing while nothing else has changed. It goes through the unmatched payments
+    // a page at a time.
+    let first_page = api.post_empty("/v1/payments/rematch?limit=2").await;
+    assert_eq!(first_page.status, StatusCode::OK, "{}", first_page.body);
+    assert_eq!(
+        first_page.body["summary"],
+        json!({ "total": 2, "matched": 0, "suggested": 0, "unmatched": 2 })
+    );
+    assert_eq!(first_page.body["items"], json!([]));
+    assert_eq!(first_page.body["next_cursor"], ids[1].as_str());
+    let second_page = api
+        .post_empty(&format!("/v1/payments/rematch?limit=2&cursor={}", ids[1]))
+        .await;
+    assert_eq!(second_page.body["summary"]["total"], 1);
+    assert_eq!(second_page.body["next_cursor"], Value::Null);
+
+    // The branch name becomes an alias and the invoices arrive: one of 99,000 and two of 77,000.
+    let alias = api
+        .post(
+            &format!("/v1/customers/{customer}/aliases"),
+            json!({ "alias": "ﾔﾏﾀﾞ ｵｵｻｶｼﾃﾝ" }),
+        )
+        .await;
+    assert_eq!(alias.status, StatusCode::CREATED);
+    let invoice = api
+        .invoice(&customer, "INV-001", 99_000, "2026-11-30")
+        .await;
+    let older = api
+        .invoice(&customer, "INV-002", 77_000, "2026-10-31")
+        .await;
+    api.invoice(&customer, "INV-003", 77_000, "2026-11-30")
+        .await;
+
+    let again = api.post_empty("/v1/payments/rematch").await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    assert_eq!(
+        again.body["summary"],
+        json!({ "total": 3, "matched": 1, "suggested": 1, "unmatched": 1 })
+    );
+    assert_eq!(again.body["next_cursor"], Value::Null);
+    let changed = again.body["items"].as_array().unwrap();
+    assert_eq!(changed.len(), 2);
+
+    // The first payment is recognised by its new alias and confirmed without a person (R1).
+    assert_eq!(changed[0]["id"], ids[0].as_str());
+    assert_eq!(changed[0]["status"], "matched");
+    assert_eq!(changed[0]["decision"]["outcome"], "auto_confirmed");
+    assert_eq!(changed[0]["decision"]["rule"], "R1");
+    assert_ne!(changed[0]["decided_at"], changed[0]["created_at"]);
+    assert_eq!(api.invoice_status(&invoice).await, "cleared");
+    let detail = api.get(&format!("/v1/payments/{}", ids[0])).await.body;
+    assert_eq!(detail["matches"][0]["state"], "confirmed");
+    assert_eq!(detail["matches"][0]["rule"], "R1");
+
+    // The second has two invoices of its amount now: a suggestion, the older one.
+    assert_eq!(changed[1]["id"], ids[1].as_str());
+    assert_eq!(changed[1]["status"], "suggested");
+    assert_eq!(
+        changed[1]["decision"]["reason"]["kind"],
+        "same_amount_invoices"
+    );
+    assert_eq!(changed[1]["decision"]["invoice_ids"], json!([older]));
+
+    // The third is still unmatched, and the only one left to look at.
+    let third = api.get(&format!("/v1/payments/{}", ids[2])).await.body;
+    assert_eq!(third["status"], "unmatched");
+    assert_eq!(third["decision"]["reason"], "payer_unknown");
+    let once_more = api.post_empty("/v1/payments/rematch").await;
+    assert_eq!(
+        once_more.body["summary"],
+        json!({ "total": 1, "matched": 0, "suggested": 0, "unmatched": 1 })
+    );
+    assert_eq!(api.count("matches").await, 2);
+
+    assert_problem(
+        &api.post_empty("/v1/payments/rematch?limit=0").await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation_failed",
+    );
+}
+
+#[sqlx::test]
+async fn a_payment_that_lost_its_suggestion_is_matched_to_what_is_left(pool: PgPool) {
+    let api = Api::new(pool);
+    let customer = api
+        .customer("株式会社山田商事", "ヤマダショウジ", false)
+        .await;
+    let october = api
+        .invoice(&customer, "INV-010", 55_000, "2026-10-31")
+        .await;
+    let november = api
+        .invoice(&customer, "INV-011", 55_000, "2026-11-30")
+        .await;
+
+    // Two payments of the amount two invoices have: each is suggested the older invoice.
+    let imported = api
+        .import("both", &[("ﾔﾏﾀﾞｼﾖｳｼﾞ", 55_000), ("ﾔﾏﾀﾞｼﾖｳｼﾞ", 55_000)])
+        .await;
+    assert_eq!(imported.body["summary"]["suggested"], 2);
+    let first = format!("/v1/payments/{}", id_of(&imported.body["payments"][0]));
+    let second = format!("/v1/payments/{}", id_of(&imported.body["payments"][1]));
+
+    // A person confirms the first. The second loses its suggestion with the invoice.
+    let confirm = format!(
+        "/v1/matches/{}/confirm",
+        active_match_id(&api.get(&first).await.body)
+    );
+    assert_eq!(api.post_empty(&confirm).await.status, StatusCode::OK);
+    assert_eq!(api.invoice_status(&october).await, "cleared");
+    let lost = api.get(&second).await.body;
+    assert_eq!(lost["status"], "unmatched");
+    assert_eq!(lost["matches"][0]["cancel_reason"], "invoice_cleared");
+
+    // Decided again, it has one invoice of its amount left: confirmed without a person.
+    let again = api.post_empty("/v1/payments/rematch").await;
+    assert_eq!(
+        again.body["summary"],
+        json!({ "total": 1, "matched": 1, "suggested": 0, "unmatched": 0 })
+    );
+    assert_eq!(api.invoice_status(&november).await, "cleared");
+    let settled = api.get(&second).await.body;
+    assert_eq!(settled["status"], "matched");
+    assert_eq!(settled["decision"]["outcome"], "auto_confirmed");
+    let history = settled["matches"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["state"], "cancelled");
+    assert_eq!(history[1]["state"], "confirmed");
+    assert_eq!(
+        history[1]["allocations"][0]["invoice_id"],
+        november.as_str()
+    );
+}
+
+#[sqlx::test]
+async fn a_line_that_clears_an_invoice_takes_the_suggestion_of_an_earlier_line(pool: PgPool) {
+    let api = Api::new(pool);
+    let customer = api
+        .customer("株式会社山田商事", "ヤマダショウジ", false)
+        .await;
+    for (number, amount, due) in [
+        ("INV-001", 55_000, "2026-10-31"),
+        ("INV-002", 55_000, "2026-11-30"),
+        ("INV-003", 33_000, "2026-11-30"),
+    ] {
+        api.invoice(&customer, number, amount, due).await;
+    }
+
+    // Line 1 has two invoices of its amount: a suggestion. Line 2 pays all three invoices, the only
+    // combination with that sum: confirmed, and the invoice suggested to line 1 is gone.
+    let imported = api
+        .import("one-batch", &[("ﾔﾏﾀﾞｼﾖｳｼﾞ", 55_000), ("ﾔﾏﾀﾞｼﾖｳｼﾞ", 143_000)])
+        .await;
+    assert_eq!(imported.status, StatusCode::CREATED, "{}", imported.body);
+    assert_eq!(
+        imported.body["summary"],
+        json!({ "total": 2, "matched": 1, "suggested": 0, "unmatched": 1 })
+    );
+    let first = &imported.body["payments"][0];
+    assert_eq!(first["decision"]["outcome"], "suggested");
+    assert_eq!(first["status"], "unmatched");
+    let detail = api
+        .get(&format!("/v1/payments/{}", id_of(first)))
+        .await
+        .body;
+    assert_eq!(detail["matches"][0]["state"], "cancelled");
+    assert_eq!(detail["matches"][0]["cancel_reason"], "invoice_cleared");
+
+    let second = &imported.body["payments"][1];
+    assert_eq!(second["status"], "matched");
+    assert_eq!(second["decision"]["rule"], "R2");
+    assert_eq!(
+        api.get("/v1/invoices?status=open").await.body["items"],
+        json!([])
     );
 }
 

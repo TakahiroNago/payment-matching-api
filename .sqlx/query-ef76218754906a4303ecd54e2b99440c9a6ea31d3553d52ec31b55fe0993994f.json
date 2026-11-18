@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE payments p\n         SET payer_name_normalized = d.normalized,\n             decision = d.decision,\n             decided_at = now(),\n             status = COALESCE(\n                 (SELECT CASE m.state WHEN 'confirmed' THEN 'matched' ELSE 'suggested' END\n                  FROM matches m\n                  WHERE m.payment_id = p.id AND m.state <> 'cancelled'),\n                 'unmatched')\n         FROM UNNEST($1::uuid[], $2::text[], $3::jsonb[]) AS d (id, normalized, decision)\n         WHERE p.id = d.id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray",
+        "JsonbArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ef76218754906a4303ecd54e2b99440c9a6ea31d3553d52ec31b55fe0993994f"
+}

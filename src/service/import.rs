@@ -3,14 +3,13 @@
 use sqlx::PgPool;
 use time::Date;
 
-use super::matching::record_match;
-use crate::domain::matching::{Decision, MatchingConfig, OpenInvoice, Payer, decide};
+use super::auto::AutoMatcher;
+use crate::domain::matching::MatchingConfig;
 use crate::domain::normalize::normalize_payer_name;
-use crate::domain::{BatchId, InvoiceId, PaymentId, Yen};
+use crate::domain::{BatchId, PaymentId, Yen};
 use crate::error::AppError;
-use crate::repo::matches::MatchState;
-use crate::repo::payments::{NewPayment, Payment, PaymentStatus};
-use crate::repo::{customers, invoices, payments};
+use crate::repo::payments;
+use crate::repo::payments::{Decided, NewPayment, Payment};
 
 pub struct ImportLine {
     pub paid_on: Date,
@@ -73,77 +72,46 @@ pub async fn import(
         )));
     }
 
-    for (index, line) in lines.iter().enumerate() {
-        let line_no = i32::try_from(index + 1)
-            .map_err(|_| AppError::Internal("too many lines in a batch".to_owned()))?;
-        let normalized = normalize_payer_name(&line.payer_name);
-        let resolved = match &normalized {
-            Some(name) => customers::resolve_payer(&mut tx, name).await?,
-            None => None,
-        };
+    let normalized: Vec<Option<String>> = lines
+        .iter()
+        .map(|line| normalize_payer_name(&line.payer_name))
+        .collect();
 
-        // Lines are matched one after another inside the transaction, so a line sees the invoices cleared by
-        // the lines before it.
-        let candidates: Vec<OpenInvoice> = match &resolved {
-            Some(payer) => invoices::open_of_customer(&mut tx, payer.customer_id).await?,
-            None => {
-                // The decision reports at most this many candidates, so more need not be read.
-                let limit = MatchingConfig::MAX_R4_CANDIDATES as i64;
-                invoices::open_with_amount(&mut tx, line.amount, limit).await?
-            }
-        };
-        let payer = match &resolved {
-            Some(payer) => Payer::Known {
-                fee_deducted: payer.fee_deducted,
-                open_invoices: &candidates,
-            },
-            None => Payer::Unknown {
-                same_amount_invoices: &candidates,
-            },
-        };
-        let decision = decide(line.amount, payer, config);
+    // Three statements for the whole batch (the payments, what they are matched against, the decisions) and
+    // one or two for each line that gets a match: the lock is held for all of it.
+    let mut new_payments = Vec::with_capacity(lines.len());
+    for (index, (line, normalized)) in lines.iter().zip(&normalized).enumerate() {
+        new_payments.push(NewPayment {
+            id: PaymentId::generate(),
+            line_no: i32::try_from(index + 1)
+                .map_err(|_| AppError::Internal("too many lines in a batch".to_owned()))?,
+            paid_on: line.paid_on,
+            amount: line.amount,
+            payer_name_raw: &line.payer_name,
+            payer_name_normalized: normalized.as_deref().unwrap_or(""),
+        });
+    }
+    payments::insert_many(&mut tx, batch_id, &new_payments).await?;
 
-        let payment_id = PaymentId::generate();
-        let status = match &decision {
-            Decision::AutoConfirmed { .. } => PaymentStatus::Matched,
-            Decision::Suggested { .. } => PaymentStatus::Suggested,
-            Decision::Unmatched { .. } => PaymentStatus::Unmatched,
-        };
-        payments::insert(
-            &mut tx,
-            &NewPayment {
-                id: payment_id,
-                batch_id,
-                line_no,
-                paid_on: line.paid_on,
-                amount: line.amount,
-                payer_name_raw: &line.payer_name,
-                payer_name_normalized: normalized.as_deref().unwrap_or(""),
-                status,
-                decision: serde_json::to_value(&decision).map_err(|e| {
-                    AppError::Internal(format!("decision is not serializable: {e}"))
-                })?,
-            },
-        )
+    let mut matcher = AutoMatcher::new(config);
+    matcher
+        .preload(&mut tx, normalized.iter().flatten().map(String::as_str))
         .await?;
 
-        let (rule, invoice_ids, fee, state) = match &decision {
-            Decision::AutoConfirmed {
-                rule,
-                invoice_ids,
-                fee_amount,
-            } => (*rule, invoice_ids, *fee_amount, MatchState::Confirmed),
-            Decision::Suggested {
-                rule,
-                invoice_ids,
-                fee_amount,
-                ..
-            } => (*rule, invoice_ids, *fee_amount, MatchState::Suggested),
-            Decision::Unmatched { .. } => continue,
-        };
-        let chosen = with_amounts(invoice_ids, &candidates)?;
-        record_match(&mut tx, payment_id, rule, state, &chosen, fee).await?;
+    // Lines are matched one after another, so a line sees the invoices cleared by the lines before it.
+    let mut decided = Vec::with_capacity(lines.len());
+    for (payment, normalized) in new_payments.iter().zip(&normalized) {
+        let judgement = matcher
+            .decide(&mut tx, payment.amount, normalized.as_deref())
+            .await?;
+        matcher.record(&mut tx, payment.id, &judgement).await?;
+        decided.push(Decided {
+            id: payment.id,
+            payer_name_normalized: payment.payer_name_normalized.to_owned(),
+            decision: judgement.decision_json()?,
+        });
     }
+    payments::set_decisions(&mut tx, &decided).await?;
 
     let payments = payments::of_batch(&mut tx, batch_id).await?;
     tx.commit().await?;
@@ -152,21 +120,4 @@ pub async fn import(
         replayed: false,
         payments,
     })
-}
-
-fn with_amounts(
-    ids: &[InvoiceId],
-    candidates: &[OpenInvoice],
-) -> Result<Vec<(InvoiceId, Yen)>, AppError> {
-    ids.iter()
-        .map(|id| {
-            candidates
-                .iter()
-                .find(|invoice| invoice.id == *id)
-                .map(|invoice| (invoice.id, invoice.amount))
-                .ok_or_else(|| {
-                    AppError::Internal("the decision names an invoice it was not given".to_owned())
-                })
-        })
-        .collect()
 }

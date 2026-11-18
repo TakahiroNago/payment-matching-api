@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.alias_normalized, c.id AS \"customer_id: CustomerId\", c.fee_deducted\n           FROM customer_aliases a JOIN customers c ON c.id = a.customer_id\n           WHERE a.alias_normalized = ANY($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias_normalized",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "customer_aliases",
+            "name": "alias_normalized"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "customer_id: CustomerId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "customers",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "fee_deducted",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "customers",
+            "name": "fee_deducted"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "563eaa84a1663784df0759e82404e5254420d88733ecc57b22a0b9da88d08300"
+}

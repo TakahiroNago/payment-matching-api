@@ -104,6 +104,34 @@ pub async fn open_of_customer(
     .await
 }
 
+/// The open invoices of these customers, each with its customer, oldest first.
+pub async fn open_of_customers(
+    conn: &mut PgConnection,
+    customer_ids: &[CustomerId],
+) -> sqlx::Result<Vec<(CustomerId, OpenInvoice)>> {
+    let ids: Vec<Uuid> = customer_ids.iter().map(|id| id.0).collect();
+    let rows = sqlx::query!(
+        r#"SELECT customer_id AS "customer_id: CustomerId", id AS "id: InvoiceId",
+                  amount AS "amount: Yen", due_date
+           FROM invoices WHERE customer_id = ANY($1) AND status = 'open'
+           ORDER BY due_date, id"#,
+        &ids,
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let invoice = OpenInvoice {
+                id: row.id,
+                amount: row.amount,
+                due_date: row.due_date,
+            };
+            (row.customer_id, invoice)
+        })
+        .collect())
+}
+
 /// The oldest open invoices of any customer with exactly this amount.
 pub async fn open_with_amount(
     conn: &mut PgConnection,
@@ -137,18 +165,6 @@ pub async fn lock_many(conn: &mut PgConnection, ids: &[InvoiceId]) -> sqlx::Resu
     )
     .fetch_all(conn)
     .await
-}
-
-/// Marks the invoices cleared and returns how many were open. The caller compares the count with the number
-/// of ids: a smaller count means an invoice was cleared by someone else (invariant I2).
-pub async fn mark_cleared(conn: &mut PgConnection, ids: &[InvoiceId]) -> sqlx::Result<u64> {
-    let done = sqlx::query!(
-        "UPDATE invoices SET status = 'cleared' WHERE id = ANY($1) AND status = 'open'",
-        &raw(ids),
-    )
-    .execute(conn)
-    .await?;
-    Ok(done.rows_affected())
 }
 
 /// Marks the invoices open again and returns how many were cleared.

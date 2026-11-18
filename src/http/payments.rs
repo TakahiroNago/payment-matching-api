@@ -12,6 +12,7 @@ use crate::domain::{BatchId, PaymentId, Yen};
 use crate::error::{AppError, FieldError};
 use crate::repo::payments::{self, ListFilter, Payment, PaymentStatus};
 use crate::service::import::{ImportLine, import as import_batch};
+use crate::service::rematch::rematch as rematch_unmatched;
 use crate::service::{PaymentDetail, payment_detail};
 
 const MAX_LINES: usize = 1_000;
@@ -60,6 +61,23 @@ pub struct Summary {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RematchQuery {
+    cursor: Option<PaymentId>,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct RematchResponse {
+    /// `total` is the number of unmatched payments looked at; the rest is what became of them.
+    summary: Summary,
+    /// The payments that are no longer unmatched, as they are now, oldest first.
+    items: Vec<Payment>,
+    /// Pass as `cursor` to look at the unmatched payments that follow; `null` when there are none.
+    next_cursor: Option<PaymentId>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     status: Option<String>,
     cursor: Option<PaymentId>,
@@ -100,17 +118,7 @@ pub async fn import(
     )
     .await?;
 
-    let mut summary = Summary {
-        total: outcome.payments.len(),
-        ..Summary::default()
-    };
-    for payment in &outcome.payments {
-        match payment.status.as_str() {
-            "matched" => summary.matched += 1,
-            "suggested" => summary.suggested += 1,
-            _ => summary.unmatched += 1,
-        }
-    }
+    let summary = summarize(&outcome.payments);
     let status = if outcome.replayed {
         StatusCode::OK
     } else {
@@ -125,6 +133,21 @@ pub async fn import(
             payments: outcome.payments,
         }),
     ))
+}
+
+fn summarize(payments: &[Payment]) -> Summary {
+    let mut summary = Summary {
+        total: payments.len(),
+        ..Summary::default()
+    };
+    for payment in payments {
+        match payment.status.as_str() {
+            "matched" => summary.matched += 1,
+            "suggested" => summary.suggested += 1,
+            _ => summary.unmatched += 1,
+        }
+    }
+    summary
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<&str, AppError> {
@@ -174,6 +197,28 @@ fn validate(body: &ImportRequest) -> Result<(), AppError> {
     } else {
         Err(AppError::Validation(errors))
     }
+}
+
+/// Decides again about unmatched payments, a page at a time.
+pub async fn rematch(
+    State(state): State<AppState>,
+    ApiQuery(query): ApiQuery<RematchQuery>,
+) -> Result<Json<RematchResponse>, AppError> {
+    let size = page_size(query.limit)?;
+    let outcome =
+        rematch_unmatched(&state.pool, &state.config.matching, query.cursor, size).await?;
+
+    let summary = summarize(&outcome.examined);
+    let unmatched = PaymentStatus::Unmatched.as_str();
+    Ok(Json(RematchResponse {
+        summary,
+        items: outcome
+            .examined
+            .into_iter()
+            .filter(|payment| payment.status != unmatched)
+            .collect(),
+        next_cursor: outcome.next,
+    }))
 }
 
 pub async fn list(

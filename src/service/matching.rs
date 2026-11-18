@@ -17,7 +17,7 @@ use crate::domain::matching::{Rule, allocate};
 use crate::domain::{CustomerId, InvoiceId, MatchId, PaymentId, Yen};
 use crate::error::{AppError, FieldError};
 use crate::repo::customers::AliasSource;
-use crate::repo::matches::MatchState;
+use crate::repo::matches::{CancelReason, MatchState};
 use crate::repo::payments::{Payment, PaymentStatus};
 use crate::repo::{customers, invoices, matches, payments};
 
@@ -41,10 +41,7 @@ pub(crate) async fn record_match(
     let parts = allocate(chosen, fee).ok_or_else(|| {
         AppError::Internal("the fee does not fit the first invoice of the match".to_owned())
     })?;
-    let match_id = matches::insert(conn, payment_id, rule, state, fee).await?;
-    for (invoice_id, amount) in &parts {
-        matches::insert_allocation(conn, match_id, *invoice_id, *amount).await?;
-    }
+    let match_id = matches::insert(conn, payment_id, rule, state, fee, &parts).await?;
     if state == MatchState::Confirmed {
         let ids: Vec<InvoiceId> = chosen.iter().map(|(id, _)| *id).collect();
         clear_invoices(conn, &ids).await?;
@@ -58,13 +55,12 @@ pub(crate) async fn record_match(
 /// `unmatched`: they could never be confirmed, and a payment listed as `suggested` should have a suggestion
 /// that a person can act on.
 async fn clear_invoices(conn: &mut PgConnection, ids: &[InvoiceId]) -> Result<(), AppError> {
-    let cleared = invoices::mark_cleared(conn, ids).await?;
+    let cleared = matches::clear_invoices(conn, ids).await?;
     if cleared != ids.len() as u64 {
         return Err(AppError::conflict(
             "an invoice of the match is no longer open",
         ));
     }
-    matches::cancel_suggestions_naming(conn, ids).await?;
     Ok(())
 }
 
@@ -162,7 +158,7 @@ pub async fn match_manually(
 
     for existing in matches::of_payment(&mut tx, payment.id).await? {
         if existing.state == MatchState::Suggested.as_str() {
-            matches::set_cancelled(&mut tx, existing.id).await?;
+            matches::set_cancelled(&mut tx, existing.id, CancelReason::Replaced).await?;
         }
     }
     record_match(
@@ -210,7 +206,12 @@ pub async fn cancel(pool: &PgPool, match_id: MatchId) -> Result<PaymentDetail, A
             )));
         }
     }
-    matches::set_cancelled(&mut tx, match_id).await?;
+    let reason = if found.state == MatchState::Confirmed.as_str() {
+        CancelReason::Reversed
+    } else {
+        CancelReason::Dismissed
+    };
+    matches::set_cancelled(&mut tx, match_id, reason).await?;
     payments::set_status(&mut tx, found.payment_id, PaymentStatus::Unmatched).await?;
 
     let detail = detail_of(&mut tx, found.payment_id).await?;

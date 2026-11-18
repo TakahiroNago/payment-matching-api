@@ -1,7 +1,7 @@
 # 入金消込 API — 要件定義書
 
-- 版：v0.3（2026-11-18）
-- 状態：MVP 実装済み。v0.1 からの変更は §10、v0.2 からの変更は §11。
+- 版：v0.4（2026-11-18）
+- 状態：MVP 実装済み。v0.1 からの変更は §10、v0.2 からの変更は §11、v0.3 からの変更は §12。
 - 関連：[api.md](api.md)（API リファレンス）、[../README.md](../README.md)（動かし方と設計判断）
 
 この文書は個人開発・学習目的のものです。題材は一般的な経理業務の入金消込で、特定企業の製品の再現ではありません。データはすべて架空です。
@@ -61,8 +61,8 @@
 | `customer_aliases`（取引先を特定する名義） | `id`, `customer_id`, `alias_raw`, `alias_normalized`, `source`（`kana`＝取引先のカナ名／`manual`／`learned`） | `alias_normalized` は一意で空でない |
 | `invoices`（請求） | `id`, `customer_id`, `invoice_number`, `amount`, `due_date`, `status`（`open`／`cleared`） | `amount > 0`、`invoice_number` は一意 |
 | `payment_batches`（取り込み単位） | `id`, `idempotency_key`, `request_hash` | `idempotency_key` は一意 |
-| `payments`（入金） | `id`, `batch_id`, `line_no`, `paid_on`, `amount`, `payer_name_raw`, `payer_name_normalized`（正規化できなければ空）, `status`（`unmatched`／`suggested`／`matched`）, `decision`（JSONB：取り込み時の自動判定とその根拠） | `amount > 0`、`(batch_id, line_no)` は一意 |
-| `matches`（消込） | `id`, `payment_id`, `rule`（`R1`〜`R4`／`manual`）, `state`（`suggested`／`confirmed`／`cancelled`）, `fee_amount`, `confirmed_at`, `cancelled_at` | `fee_amount >= 0` |
+| `payments`（入金） | `id`, `batch_id`, `line_no`, `paid_on`, `amount`, `payer_name_raw`, `payer_name_normalized`（正規化できなければ空）, `status`（`unmatched`／`suggested`／`matched`）, `decision`（JSONB：自動判定とその根拠）, `decided_at`（その判定の時刻） | `amount > 0`、`(batch_id, line_no)` は一意 |
+| `matches`（消込） | `id`, `payment_id`, `rule`（`R1`〜`R4`／`manual`）, `state`（`suggested`／`confirmed`／`cancelled`）, `fee_amount`, `confirmed_at`, `cancelled_at`, `cancel_reason`（`dismissed`／`reversed`／`replaced`／`invoice_cleared`） | `fee_amount >= 0`、`cancel_reason` は `cancelled` のときだけ |
 | `match_allocations`（消込の内訳） | `match_id`, `invoice_id`, `amount`（その請求に充てた入金額） | 主キー `(match_id, invoice_id)`、`amount > 0` |
 
 取引先自身のカナ名も `customer_aliases` に `source = 'kana'` として入れる。「ある名義がどの取引先を指すか」を 1 つのテーブルと 1 つの一意制約で決めるためで、取引先名と別名が別々の取引先を指す状態を作れない。
@@ -130,6 +130,20 @@
 - **取消**：確定済みの消込を取り消すと、請求は `open`、入金は `unmatched` に戻る。候補を取り消す（却下する）と入金は `unmatched` になる。取り消した消込の行は履歴として残る。
 - **別名の登録**：確定・手動消込のときに指定すると、入金の正規化済み名義をその取引先の別名（`learned`）として登録する。名義が既に別の取引先のものなら 409 で、消込も行わない。
 
+### 4.6 再判定
+
+自動判定は取り込みのときに、その時点の別名と未消込請求に対して行う。その後に別名を登録した、請求を後から登録した、候補が他の入金に請求を取られて取消になった、という場合のために、`unmatched` の入金を判定し直す操作を置く（`POST /v1/payments/rematch`）。
+
+- 規則と順序は取り込みと同じ（古い入金から順に判定し、前の入金が消し込んだ請求は後の入金に見せない）。取り込みと同じ処理を通す。
+- 名義は元の文字列から正規化し直す。正規化の規則を足した後にも効くようにするため。
+- `decision` は新しい判定で置き換え、`decided_at` に時刻を残す。「なぜこの状態か」は常に最後の自動判定で説明する。
+- 対象は `unmatched` だけ。`suggested` は人が確定か却下をする（却下すれば次の再判定の対象になる）。
+- 自動では行わない。確定の応答の裏で別の入金が自動確定されると、操作した人から見えないため。呼び出す側が、別名の登録や確定の後に明示的に呼ぶ。
+
+### 4.7 取消の理由
+
+消込が `cancelled` になる経路は 4 つあり、`matches.cancel_reason` に残す：人が候補を却下した（`dismissed`）、人が確定済みの消込を取り消した（`reversed`）、人が候補の代わりに手動消込をした（`replaced`）、候補の請求が他の入金で消し込まれた（`invoice_cleared`）。最後のものは人の操作ではないので、理由がないと履歴から区別できない。
+
 ---
 
 ## 5. API
@@ -175,7 +189,7 @@
 |---|---|
 | 単体 | 名義の正規化（事例 39 件）、判定の各分岐、設定の検証、ページング、トークン比較 |
 | プロパティ（proptest） | 正規化の冪等性。判定結果の請求は重複せず、合計が「入金額 + 手数料」に等しく、内訳の合計が入金額に等しい。自動確定は説明が 1 通りのときだけ（総当たりと比較）。請求の並び順に依存しない |
-| 結合（`#[sqlx::test]`、実 PostgreSQL） | 各エンドポイントの正常系・異常系、冪等な再送、内容違いの 409、別のキーでの同じ内容の 409、同じキーの同時取り込み、同じ請求への同時確定で片方だけ成功、ロック待ちの時間切れで 503、請求が消えた候補の取消、取消と再消込、途中失敗時に何も残らない、別名の学習 |
+| 結合（`#[sqlx::test]`、実 PostgreSQL） | 各エンドポイントの正常系・異常系、冪等な再送、内容違いの 409、別のキーでの同じ内容の 409、同じキーの同時取り込み、同じ請求への同時確定で片方だけ成功、ロック待ちの時間切れで 503、請求が消えた候補の取消（別の取り込み・同じ取り込みの後の行・確定）、取消の理由、未消込の入金の再判定、取消と再消込、途中失敗時に何も残らない、別名の学習 |
 | CI（GitHub Actions） | `cargo fmt --check`、`cargo clippy -D warnings`（オフライン）、`cargo sqlx prepare --check`、`cargo test`、`cargo deny check`、イメージのビルドと起動確認 |
 
 ---
@@ -200,7 +214,7 @@
 ## 9. 拡張するなら
 
 - **分割入金・過入金**：`invoices` に消込済み額を持たせ、`match_allocations.amount` を請求額より小さくできるようにする。I2 は「内訳の合計 ≤ 請求額」に変わる。
-- **再判定**：別名や請求を後から登録したとき、`unmatched`／`suggested` の入金を判定し直すエンドポイント。
+- **再判定の範囲**：`suggested` の入金も判定し直す（別名を覚えた後、R4 の候補が R1 の自動確定に変わりうる）。同じ結果なら消込を作り直さない比較が要る。
 - **取り込み形式**：全銀フォーマット・CSV の解析を `http` の手前に足す。`service` 以降は変わらない。
 - **並行性**：advisory lock を取引先単位に分ける。
 - **OpenAPI**：`utoipa` で型から生成し、`docs/api.md` を置き換える。
@@ -236,3 +250,15 @@
 | 組み合わせ探索 | 最大 2^n | およそ 2^(n/2) | ロックを持ったまま、非同期ランタイムのスレッドの上で走るため（§4.3） |
 | 請求が消えた候補 | `suggested` のまま残り、確定すると必ず 409 | 取消にして、入金を `unmatched` に戻す（I5） | 一覧の `suggested` を「人が確定できるもの」だけにする |
 | 請求の参照 | 一覧のみ | `GET /v1/invoices/{id}` が、消し込んだ消込と入金を返す | 根拠を請求の側からも辿れるように |
+
+---
+
+## 12. v0.3 からの変更
+
+| 項目 | v0.3 | v0.4 | 理由 |
+|---|---|---|---|
+| 取消の理由 | 記録しない | `matches.cancel_reason`（§4.7） | 自動の取消（I5）が加わり、人の却下と区別できなくなった |
+| 再判定 | なし（§9 の拡張案） | `POST /v1/payments/rematch`。`unmatched` の入金が対象（§4.6） | 候補を失って `unmatched` に戻った入金や、別名・請求を後から登録した入金を、手動消込なしで消し込めるように |
+| `decision` | 取り込み時の判定のまま | 再判定で置き換え、`decided_at` を持つ | 再判定で確定した消込の根拠を入金から読めるように |
+| 入金の `status` の決め方（取り込み・再判定） | 判定結果から | その入金の有効な消込から | 同じバッチの後の行が、前の行の候補を取消にすることがある |
+| 取り込みの SQL | 行ごとに名義の解決・請求の読み込み・入金の挿入・消込の挿入（内訳は 1 件ずつ）・請求の更新 | 入金の挿入、照合先の読み込み、判定の保存はバッチで 1 文ずつ。行ごとは消込の挿入（内訳ごと 1 文）と請求の消込（候補の取消ごと 1 文） | ロックを持つ時間を短くする。1,000 行の取り込みが約 2.9 秒から約 1.0 秒（手元の Docker 上の PostgreSQL） |

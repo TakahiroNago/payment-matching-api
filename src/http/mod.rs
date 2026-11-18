@@ -38,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .route("/invoices/{id}", get(invoices::get))
         .route("/payment-batches", post(payments::import))
         .route("/payments", get(payments::list))
+        .route("/payments/rematch", post(payments::rematch))
         .route("/payments/{id}", get(payments::get))
         .route("/payments/{id}/matches", post(matches::create_manual))
         .route("/matches/{id}/confirm", post(matches::confirm))
