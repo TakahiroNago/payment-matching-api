@@ -6,11 +6,9 @@ use std::ops::{Add, Sub};
 use serde::{Deserialize, Serialize};
 
 /// An amount of yen. The newtype keeps amounts apart from counts, line numbers and other integers.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(sqlx::Type), sqlx(transparent))]
 #[serde(transparent)]
-#[sqlx(transparent)]
 pub struct Yen(pub i64);
 
 impl Yen {

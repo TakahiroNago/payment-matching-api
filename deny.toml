@@ -10,6 +10,8 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The crates of this workspace depend on each other by path, without a version. None of them is published.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

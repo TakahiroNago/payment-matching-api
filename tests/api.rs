@@ -2611,3 +2611,180 @@ async fn the_consistency_rules_notice_damaged_data(pool: PgPool) {
         tx.rollback().await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// The browser demo
+// ---------------------------------------------------------------------------------------------------------
+
+/// The browser demo (`crates/demo-wasm`) decides an import without a database. It uses the same rules, but
+/// follows the import itself in its own code; this holds it to what the server does.
+#[sqlx::test]
+async fn the_browser_demo_decides_like_the_server(pool: PgPool) {
+    let api = Api::new(pool);
+    let mut dice = Dice(20_261_119);
+    let mut seen = std::collections::BTreeSet::new();
+
+    for round in 0..60 {
+        sqlx::query(
+            "TRUNCATE match_allocations, matches, payments, payment_batches, invoices, customer_aliases,
+                      customers",
+        )
+        .execute(&api.pool)
+        .await
+        .unwrap();
+
+        // The scenario: three customers, perhaps the branch name as an alias, some invoices, some payments.
+        let kana = ["ヤマダショウジ", "スズキコウギョウ", "タナカサンギョウ"];
+        let fee_deducted = [false, true, true];
+        let alias_of = (dice.roll(2) == 0).then(|| dice.roll(3));
+        let invoices: Vec<(usize, i64, &str)> = (0..dice.roll(10))
+            .map(|_| {
+                (
+                    dice.roll(3),
+                    dice.pick(&AMOUNTS),
+                    dice.pick(&["2026-10-31", "2026-11-30", "2026-12-31"]),
+                )
+            })
+            .collect();
+        let payments: Vec<(&str, i64)> = (0..=dice.roll(10))
+            .map(|_| {
+                let amount = match dice.roll(5) {
+                    0 => dice.pick(&AMOUNTS) - dice.pick(&[110, 440]),
+                    1 => dice.pick(&AMOUNTS) + dice.pick(&AMOUNTS),
+                    2 => dice.pick(&AMOUNTS) + dice.pick(&AMOUNTS) - 440,
+                    _ => dice.pick(&AMOUNTS),
+                };
+                (dice.pick(&PAYERS), amount)
+            })
+            .collect();
+
+        // The demo.
+        let scenario = json!({
+            "customers": (0..3).map(|c| json!({
+                "name_kana": kana[c],
+                "fee_deducted": fee_deducted[c],
+                "aliases": if alias_of == Some(c) { vec!["ﾔﾏﾀﾞ ｵｵｻｶｼﾃﾝ"] } else { vec![] },
+            })).collect::<Vec<_>>(),
+            "invoices": invoices.iter().map(|(customer, amount, due)| json!({
+                "customer": customer, "amount": amount, "due_date": due,
+            })).collect::<Vec<_>>(),
+            "payments": payments.iter().map(|(payer, amount)| json!({
+                "payer_name": payer, "amount": amount,
+            })).collect::<Vec<_>>(),
+        });
+        let demo =
+            payment_matching_demo::simulate(&serde_json::from_value(scenario.clone()).unwrap())
+                .unwrap();
+        let demo = serde_json::to_value(&demo).unwrap();
+
+        // The server.
+        let mut customer_ids = Vec::new();
+        for c in 0..3 {
+            let id = api.customer("取引先", kana[c], fee_deducted[c]).await;
+            if alias_of == Some(c) {
+                let alias = api
+                    .post(
+                        &format!("/v1/customers/{id}/aliases"),
+                        json!({ "alias": "ﾔﾏﾀﾞ ｵｵｻｶｼﾃﾝ" }),
+                    )
+                    .await;
+                assert_eq!(alias.status, StatusCode::CREATED, "{}", alias.body);
+            }
+            customer_ids.push(id);
+        }
+        let mut invoice_ids = Vec::new();
+        for (index, (customer, amount, due)) in invoices.iter().enumerate() {
+            let number = format!("INV-{round}-{index}");
+            invoice_ids.push(
+                api.invoice(&customer_ids[*customer], &number, *amount, due)
+                    .await,
+            );
+        }
+        let imported = api.import(&format!("round-{round}"), &payments).await;
+        assert_eq!(imported.status, StatusCode::CREATED, "{}", imported.body);
+
+        // Ids of the server become positions in the scenario, which is what the demo reports.
+        let position = |id: &Value| {
+            invoice_ids
+                .iter()
+                .position(|known| known == id.as_str().unwrap())
+                .unwrap()
+        };
+        let positions = |ids: &Value| -> Vec<usize> {
+            ids.as_array()
+                .map(|ids| ids.iter().map(position).collect())
+                .unwrap_or_default()
+        };
+        for (line, served) in imported.body["payments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let decision = &served["decision"];
+            // `reason` is a string for an unmatched payment and an object for a suggestion.
+            let reason = decision["reason"]
+                .as_str()
+                .or_else(|| decision["reason"]["kind"].as_str());
+            let expected = json!({
+                "normalized": served["payer_name_normalized"].as_str().filter(|name| !name.is_empty()),
+                "status": served["status"],
+                "outcome": decision["outcome"],
+                "rule": decision["rule"],
+                "invoices": positions(&decision["invoice_ids"]),
+                "fee_amount": decision["fee_amount"].as_i64().unwrap_or(0),
+                "reason": reason,
+                "count": decision["reason"]["count"],
+                "candidates": positions(&decision["reason"]["candidate_invoice_ids"]),
+            });
+            let shown = &demo["payments"][line];
+            let actual = json!({
+                "normalized": shown["normalized"],
+                "status": shown["status"],
+                "outcome": shown["decision"]["outcome"],
+                "rule": shown["decision"]["rule"],
+                "invoices": shown["decision"]["invoices"],
+                "fee_amount": shown["decision"]["fee_amount"],
+                "reason": shown["decision"]["reason"],
+                "count": shown["decision"]["count"],
+                "candidates": shown["decision"]["candidates"],
+            });
+            assert_eq!(
+                actual, expected,
+                "round {round}, payment {line} of\n{scenario:#}"
+            );
+            seen.insert(format!(
+                "{} {} {}",
+                expected["status"].as_str().unwrap(),
+                expected["rule"].as_str().unwrap_or("-"),
+                reason.unwrap_or("-")
+            ));
+            if shown["lost_to"].is_number() {
+                seen.insert("lost its suggestion to a later line".to_owned());
+            }
+        }
+        for (index, id) in invoice_ids.iter().enumerate() {
+            assert_eq!(
+                demo["invoices"][index]["status"],
+                api.invoice_status(id).await.as_str(),
+                "round {round}, invoice {index} of\n{scenario:#}"
+            );
+        }
+    }
+
+    // The comparison is worth something only if the scenarios reached every kind of decision.
+    for kind in [
+        "matched R1 -",
+        "matched R2 -",
+        "suggested R1 same_amount_invoices",
+        "suggested R2 several_combinations",
+        "suggested R3 fee_deducted",
+        "suggested R3 several_combinations",
+        "suggested R4 payer_unknown",
+        "unmatched - payer_unknown",
+        "unmatched - no_candidate",
+        "lost its suggestion to a later line",
+    ] {
+        assert!(seen.contains(kind), "never seen: {kind}; seen: {seen:?}");
+    }
+}

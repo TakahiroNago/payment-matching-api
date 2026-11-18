@@ -5,6 +5,8 @@
 
 請求（売掛金）と銀行入金の明細を突き合わせる「入金消込」の API サーバーです。Rust（axum + sqlx）と PostgreSQL で書いています。
 
+**[ブラウザ内デモ](https://takahironago.github.io/payment-matching-api/)**：請求と入金を入力すると、どの規則でどう判定されるかをその場で試せます（判定のコードを WebAssembly にしたもので、サーバーはありません）。
+
 - 振込名義のゆれ（半角カナ、`ｶ)` などの法人格の略語）を正規化して取引先を特定します。
 - 1 回の入金で複数の請求を支払う合算入金、振込手数料を差し引いた入金を判定します。
 - 説明が 1 通りに決まるときだけ自動で消し込み、それ以外は候補を出して人が確定します。
@@ -12,7 +14,7 @@
 - どの規則で、どの請求に、なぜ消し込んだかを入金ごとに記録します。取り消した消込も、理由と一緒に履歴として残します。
 - 登録の間違いは API で直せます（別名の削除、請求の無効化）。直した後は、未消込の入金を判定し直せます。
 
-> **個人開発・学習目的のリポジトリです。** 題材は一般的な経理業務で、特定の製品の再現ではありません。データはすべて架空で、実在の取引データは使っていません。画面はなく、本番運用を想定した認証・権限管理も持ちません（[限界](#限界)）。
+> **個人開発・学習目的のリポジトリです。** 題材は一般的な経理業務で、特定の製品の再現ではありません。データはすべて架空で、実在の取引データは使っていません。API サーバーに画面はなく、本番運用を想定した認証・権限管理も持ちません（[限界](#限界)）。
 
 *English: an accounts-receivable reconciliation API in Rust (axum, sqlx, PostgreSQL). It normalizes Japanese payer names from bank statements, matches payments to open invoices with four deterministic rules (exact, combined, fee-deducted, amount-only), confirms a match automatically only when it is the single explanation, and keeps imports idempotent. A personal learning project with fictional data. Details: [docs/requirements.md](docs/requirements.md), [docs/api.md](docs/api.md) (both in Japanese).*
 
@@ -78,7 +80,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/payment-batches \
 
 ## 設計判断
 
-**自動確定するのは、説明が 1 通りのときだけ。** 同額の請求が 2 件ある、組み合わせが 2 通りある、といった場合は候補にとどめます。手数料の差引（R3）と名義不明（R4）は、1 通りでも人が確定します。判定は DB に触れない純粋関数（[`src/domain/matching.rs`](src/domain/matching.rs)）で、「自動確定は説明が 1 通りのときだけ」を総当たりとの比較でプロパティテストしています。
+**自動確定するのは、説明が 1 通りのときだけ。** 同額の請求が 2 件ある、組み合わせが 2 通りある、といった場合は候補にとどめます。手数料の差引（R3）と名義不明（R4）は、1 通りでも人が確定します。判定は DB に触れない純粋関数（[`crates/domain/src/matching.rs`](crates/domain/src/matching.rs)）で、「自動確定は説明が 1 通りのときだけ」を総当たりとの比較でプロパティテストしています。
 
 **金額は円の整数。** `Yen(i64)` の newtype で持ち、浮動小数点を使いません。ID もテーブルごとの型（`InvoiceId`、`PaymentId` など）にして、取り違えをコンパイル時に防ぎます。
 
@@ -102,11 +104,33 @@ curl -s -X POST http://127.0.0.1:8080/v1/payment-batches \
 
 要件と、最初の案から変えた点とその理由は [docs/requirements.md](docs/requirements.md) にあります。
 
+## ブラウザ内デモ
+
+[https://takahironago.github.io/payment-matching-api/](https://takahironago.github.io/payment-matching-api/)
+
+名義の正規化と突合の規則は I/O を持たないクレート（`crates/domain`）に分けてあり、それを WebAssembly にして静的なページから呼んでいます。サーバーもデータベースもないので、入力はどこにも送信されません。
+
+- **動くもの**：1 回の取り込みの自動判定。名義の正規化、R1〜R4、自動確定された入金が消し込んだ請求は後の行の対象にならないこと、後の行が請求を消し込むと前の行の候補が取消になること。
+- **ないもの**：データベースを通る部分。取り込みの冪等性、同時確定の排他、候補の確定・却下・手動消込、取消の履歴、再判定。これらは API サーバーとそのテストにあります。
+- **サーバーとの一致**：規則はサーバーと同じコードですが、「どの請求が未消込か」を追う部分はデモ側（`crates/demo-wasm`）で書いています。結合テスト `the_browser_demo_decides_like_the_server` が、無作為に作った 60 通りの取り込みを API とデモの両方に通し、行ごとの判定が同じになることを確かめています。
+
+手元で動かす場合（[wasm-pack](https://rustwasm.github.io/wasm-pack/) が必要です）：
+
+```sh
+wasm-pack build crates/demo-wasm --target web --release --out-dir ../../demo/pkg --no-pack
+python -m http.server 8000 --directory demo      # http://127.0.0.1:8000/
+```
+
+`main` に入ると、GitHub Actions（`pages.yml`）がビルドして GitHub Pages に公開します。
+
 ## 構成
 
 ```
-src/
+crates/
   domain/    型（Yen、各 ID）、名義の正規化、突合の規則。I/O なし
+  demo-wasm/ ブラウザ内デモ用の WebAssembly の入口（サーバーには入らない）
+demo/        ブラウザ内デモのページ（HTML・JS・CSS）
+src/
   repo/      SQL（sqlx のマクロでコンパイル時に検査）
   service/   取り込み・再判定・確定・手動消込・取消・請求の無効化。1 関数 = 1 トランザクション
   http/      ルーティング、認証、入力検証、エラー変換
@@ -119,11 +143,11 @@ tests/api.rs 結合テスト（ルーター経由、実 PostgreSQL）
 
 ```sh
 docker compose up -d db
-cargo test
+cargo test --workspace
 ```
 
-- **単体・プロパティテスト（34 件）**：名義の正規化（事例 39 件と冪等性）、突合の各規則、判定結果の金額が必ず合うこと、請求の並び順に依存しないこと、設定の検証、ハンドラーのパニックと時間切れの応答。
-- **結合テスト（40 件）**：`#[sqlx::test]` がテストごとに専用のデータベースを作ります。各エンドポイントの正常系・異常系に加え、同じ請求への同時確定で片方だけが成功すること、同じキーの同時取り込みでバッチが 1 つしかできないこと、取り込みの途中で失敗すると何も残らないこと、同じ内容を別のキーで送ると拒否されること、ロックを待ちきれない要求が 503 になること、請求が消し込まれると他の入金の候補が取消になること、取消の理由が残ること、未消込の入金を判定し直せること、間違った別名を削除できること、無効にした請求が突合から外れることを確認しています。
+- **単体・プロパティテスト（37 件）**：名義の正規化（事例 39 件と冪等性）、突合の各規則、判定結果の金額が必ず合うこと、請求の並び順に依存しないこと、設定の検証、ハンドラーのパニックと時間切れの応答、ブラウザ内デモの判定。
+- **結合テスト（41 件）**：`#[sqlx::test]` がテストごとに専用のデータベースを作ります。各エンドポイントの正常系・異常系に加え、同じ請求への同時確定で片方だけが成功すること、同じキーの同時取り込みでバッチが 1 つしかできないこと、取り込みの途中で失敗すると何も残らないこと、同じ内容を別のキーで送ると拒否されること、ロックを待ちきれない要求が 503 になること、請求が消し込まれると他の入金の候補が取消になること、取消の理由が残ること、未消込の入金を判定し直せること、間違った別名を削除できること、無効にした請求が突合から外れること、ブラウザ内デモがサーバーと同じ判定をすることを確認しています。
 - **整合性テスト（結合テストのうち 3 件）**：取り込み・請求登録・確定・取消・手動消込・再判定・別名の登録と削除・請求の無効化をシードから決めた順に 400 回ずつ実行し、1 回ごとに入金・消込・請求の間の規則（I1〜I3、I5、入金の `status` と消込の `state` の対応など 7 つ）を SQL で検査します。規則の検査自体は、データをわざと壊して検出できることを別のテストで確かめています。
 
 ## 開発
@@ -143,7 +167,7 @@ SQL を変えたら `.sqlx` を作り直してコミットします。
 cargo sqlx prepare -- --all-targets
 ```
 
-CI（GitHub Actions）は `cargo fmt --check`、`cargo clippy -D warnings`、`cargo sqlx prepare --check`、`cargo test`、`cargo deny check`、Docker イメージのビルドと起動確認を実行します。
+CI（GitHub Actions）は `cargo fmt --check`、`cargo clippy -D warnings`、`cargo sqlx prepare --check`、`cargo test`、デモの wasm32 向けビルド、`cargo deny check`、Docker イメージのビルドと起動確認を実行します。
 
 | 環境変数 | 既定 | 内容 |
 |---|---|---|
