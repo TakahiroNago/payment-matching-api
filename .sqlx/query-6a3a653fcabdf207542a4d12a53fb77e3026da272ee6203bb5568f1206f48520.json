@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH voided AS (\n               UPDATE invoices SET status = 'void' WHERE id = $1 AND status = 'open'\n               RETURNING id\n           ),\n           stale AS (\n               UPDATE matches\n               SET state = 'cancelled', cancelled_at = now(), cancel_reason = 'invoice_voided'\n               WHERE state = 'suggested'\n                 AND id IN (SELECT match_id FROM match_allocations WHERE invoice_id = $1)\n                 AND EXISTS (SELECT 1 FROM voided)\n               RETURNING payment_id\n           ),\n           left_unmatched AS (\n               UPDATE payments SET status = 'unmatched' WHERE id IN (SELECT payment_id FROM stale)\n           )\n           SELECT count(*) AS \"voided!\" FROM voided",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "voided!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6a3a653fcabdf207542a4d12a53fb77e3026da272ee6203bb5568f1206f48520"
+}

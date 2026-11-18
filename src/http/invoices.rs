@@ -11,6 +11,7 @@ use crate::domain::{CustomerId, InvoiceId, Yen};
 use crate::error::{AppError, FieldError, is_foreign_key_violation, is_unique_violation};
 use crate::repo::invoices::{self, Invoice, ListFilter, NewInvoice};
 use crate::repo::matches::{self, ClearedBy};
+use crate::service::matching;
 
 const MAX_NUMBER_CHARS: usize = 50;
 
@@ -77,7 +78,7 @@ pub async fn create(
 pub struct InvoiceDetail {
     #[serde(flatten)]
     invoice: Invoice,
-    /// `null` while the invoice is open.
+    /// `null` unless the invoice is cleared.
     cleared_by: Option<ClearedBy>,
 }
 
@@ -101,6 +102,14 @@ pub async fn get(
     }))
 }
 
+pub async fn void(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<InvoiceId>,
+) -> Result<Json<Invoice>, AppError> {
+    let invoice = matching::void_invoice(&state.pool, id).await?;
+    Ok(Json(invoice))
+}
+
 pub async fn list(
     State(state): State<AppState>,
     ApiQuery(query): ApiQuery<ListQuery>,
@@ -109,6 +118,7 @@ pub async fn list(
     if let Some(status) = query.status.as_deref()
         && status != invoices::STATUS_OPEN
         && status != invoices::STATUS_CLEARED
+        && status != invoices::STATUS_VOID
     {
         return Err(AppError::invalid("status", "unknown_value"));
     }

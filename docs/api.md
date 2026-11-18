@@ -15,9 +15,11 @@
 | POST | `/v1/customers` | 取引先の登録 | 201 |
 | GET | `/v1/customers/{id}` | 取引先と名義の参照 | 200 |
 | POST | `/v1/customers/{id}/aliases` | 別名の登録 | 201 |
+| DELETE | `/v1/customers/{id}/aliases/{alias_id}` | 別名の削除 | 204 |
 | POST | `/v1/invoices` | 請求の登録 | 201 |
 | GET | `/v1/invoices` | 請求の一覧 | 200 |
 | GET | `/v1/invoices/{id}` | 請求と、それを消し込んだ消込 | 200 |
+| POST | `/v1/invoices/{id}/void` | 請求の無効化 | 200 |
 | POST | `/v1/payment-batches` | 入金の取り込みと自動突合 | 201（再送は 200） |
 | GET | `/v1/payments` | 入金の一覧 | 200 |
 | POST | `/v1/payments/rematch` | 未消込の入金の再判定 | 200 |
@@ -102,6 +104,15 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 
 201 で登録した別名（`source: "manual"`）を返します。409：その名義は既に登録済み（同じ取引先でも別の取引先でも）。
 
+### `DELETE /v1/customers/{id}/aliases/{alias_id}`
+
+間違って登録した（または確定時に覚えさせた）別名を削除します。本文は不要で、204 を返します。`alias_id` は `GET /v1/customers/{id}` の `aliases[].id` です。
+
+- 削除した後に取り込む入金と、再判定する入金は、この名義ではその取引先と見なされません。名義は他の取引先に登録できるようになります。
+- **この別名を通して既にできた消込や候補は変わりません。** 間違いなら、`POST /v1/matches/{id}/cancel` で取り消してください。
+- 409：取引先自身のカナ名（`source: "kana"`）は削除できません。
+- 404：その取引先にその別名はない。
+
 ---
 
 ## 請求
@@ -115,13 +126,13 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 201 で請求を返します（`status` は `open`）。
 
 - 422 `customer_id: not_found`：取引先がない。
-- 409：`invoice_number` が登録済み。
+- 409：`invoice_number` が登録済み。無効（`void`）にした請求の番号は、もう一度登録できます。
 
 ### `GET /v1/invoices`
 
 | クエリ | 内容 |
 |---|---|
-| `status` | `open`／`cleared` |
+| `status` | `open`／`cleared`／`void` |
 | `customer_id` | 取引先で絞る |
 | `limit` | 1〜200、既定 50 |
 | `cursor` | 前のページの `next_cursor` |
@@ -147,7 +158,16 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
                   "amount": 109560, "confirmed_at": "2026-11-18T03:05:00.123456Z" } }
 ```
 
-`cleared_by` は未消込（`open`）なら `null`。`amount` はこの請求に充てた入金額、`fee_amount` は消込全体の手数料です。根拠と履歴は `GET /v1/payments/{payment_id}` で見ます。
+`cleared_by` は消込済み（`cleared`）でなければ `null`。`amount` はこの請求に充てた入金額、`fee_amount` は消込全体の手数料です。根拠と履歴は `GET /v1/payments/{payment_id}` で見ます。
+
+### `POST /v1/invoices/{id}/void`
+
+間違って登録した請求を無効にします。本文は不要で、200 で請求（`status: "void"`）を返します。行は消さず、突合の対象から外します。
+
+- 無効にできるのは未消込（`open`）の請求だけです。409：消込済み（先に `POST /v1/matches/{id}/cancel` で消込を取り消す）、または既に無効。
+- この請求を含む候補は取消になり（`cancel_reason: "invoice_voided"`）、その入金は `unmatched` に戻ります。`POST /v1/payments/rematch` で判定し直せます。
+- 無効にした請求は元に戻せません。同じ `invoice_number` で正しい内容を登録し直してください。
+- 無効の請求は自動突合にも手動消込にも使えません（手動消込は 409）。
 
 ---
 
@@ -271,6 +291,7 @@ RFC 9457 の problem details（`Content-Type: application/problem+json`）で返
 | `reversed` | 人が確定済みの消込を取り消した |
 | `replaced` | 人が候補を確定せず、手動消込をした |
 | `invoice_cleared` | 候補の請求が、他の入金で消し込まれた（確定できなくなったので自動で取消） |
+| `invoice_voided` | 候補の請求が無効にされた（同上） |
 | `null` | 取消されていない。または、理由を記録する前に取消された |
 
 `allocations[].amount` はその請求に充てた入金額で、合計が入金額になります。手数料は支払期日が最も古い請求から引かれます（`invoice_amount - amount` が手数料）。

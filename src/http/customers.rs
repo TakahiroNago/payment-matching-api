@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::extract::{ApiJson, ApiPath};
-use crate::domain::CustomerId;
 use crate::domain::normalize::normalize_payer_name;
+use crate::domain::{AliasId, CustomerId};
 use crate::error::{AppError, FieldError, is_unique_violation};
 use crate::repo::customers::{self, ALIAS_UNIQUE_CONSTRAINT, Alias, AliasSource, Customer};
 
@@ -111,6 +111,26 @@ pub async fn add_alias(
         .await
         .map_err(alias_conflict)?;
     Ok((StatusCode::CREATED, Json(alias)))
+}
+
+/// Removes an alias, so that payments under this name are no longer taken for the customer's. Matches made
+/// through the alias stay as they are.
+pub async fn remove_alias(
+    State(state): State<AppState>,
+    ApiPath((id, alias_id)): ApiPath<(CustomerId, AliasId)>,
+) -> Result<StatusCode, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let alias = customers::find_alias(&mut conn, id, alias_id)
+        .await?
+        .ok_or(AppError::NotFound("alias"))?;
+    if alias.source == AliasSource::Kana.as_str() {
+        return Err(AppError::conflict(
+            "the kana name of the customer cannot be removed",
+        ));
+    }
+    // Deleted by someone else since it was read: gone either way.
+    customers::delete_alias(&mut conn, alias_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn text_problem(value: &str) -> Option<&'static str> {

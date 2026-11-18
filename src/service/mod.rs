@@ -35,7 +35,8 @@ pub struct MatchDetail {
     pub confirmed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub cancelled_at: Option<OffsetDateTime>,
-    /// Why the match was cancelled: `dismissed`, `reversed`, `replaced` or `invoice_cleared`.
+    /// Why the match was cancelled: `dismissed`, `reversed`, `replaced`, `invoice_cleared` or
+    /// `invoice_voided`.
     pub cancel_reason: Option<String>,
     pub allocations: Vec<Allocation>,
 }

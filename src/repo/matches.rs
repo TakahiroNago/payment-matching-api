@@ -75,6 +75,8 @@ pub enum CancelReason {
     Replaced,
     /// Another payment cleared an invoice of the suggestion.
     InvoiceCleared,
+    /// An invoice of the suggestion was voided.
+    InvoiceVoided,
 }
 
 impl CancelReason {
@@ -85,6 +87,7 @@ impl CancelReason {
             Self::Reversed => "reversed",
             Self::Replaced => "replaced",
             Self::InvoiceCleared => "invoice_cleared",
+            Self::InvoiceVoided => "invoice_voided",
         }
     }
 }
@@ -230,6 +233,35 @@ pub async fn clear_invoices(
     .fetch_one(conn)
     .await?;
     Ok(u64::try_from(cleared).unwrap_or(0))
+}
+
+/// Marks an open invoice void and returns whether it was open.
+///
+/// Like [`clear_invoices`], the same statement cancels every suggestion that names the invoice and leaves its
+/// payment unmatched (invariant I5).
+pub async fn void_invoice(conn: &mut PgConnection, invoice_id: InvoiceId) -> sqlx::Result<bool> {
+    let voided = sqlx::query_scalar!(
+        r#"WITH voided AS (
+               UPDATE invoices SET status = 'void' WHERE id = $1 AND status = 'open'
+               RETURNING id
+           ),
+           stale AS (
+               UPDATE matches
+               SET state = 'cancelled', cancelled_at = now(), cancel_reason = 'invoice_voided'
+               WHERE state = 'suggested'
+                 AND id IN (SELECT match_id FROM match_allocations WHERE invoice_id = $1)
+                 AND EXISTS (SELECT 1 FROM voided)
+               RETURNING payment_id
+           ),
+           left_unmatched AS (
+               UPDATE payments SET status = 'unmatched' WHERE id IN (SELECT payment_id FROM stale)
+           )
+           SELECT count(*) AS "voided!" FROM voided"#,
+        invoice_id.0,
+    )
+    .fetch_one(conn)
+    .await?;
+    Ok(voided > 0)
 }
 
 pub async fn set_cancelled(

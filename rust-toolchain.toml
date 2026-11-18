@@ -1,0 +1,10 @@
+# The compiler, rustfmt and clippy that the code is built and checked with, locally and in CI. rustup reads
+# this file and installs the toolchain when it is missing. Without it CI followed `stable`, and a new release
+# could fail the clippy job on code that had not changed.
+#
+# The Dockerfile builds with the `rust:` image of the same version (CI checks that the two agree). To move
+# to a newer Rust, change both and fix what the new clippy finds.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

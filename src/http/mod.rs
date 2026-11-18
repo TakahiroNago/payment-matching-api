@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use sqlx::PgPool;
 use tower_http::catch_panic::CatchPanicLayer;
 
@@ -34,8 +34,13 @@ pub fn router(state: AppState) -> Router {
         .route("/customers", post(customers::create))
         .route("/customers/{id}", get(customers::get))
         .route("/customers/{id}/aliases", post(customers::add_alias))
+        .route(
+            "/customers/{id}/aliases/{alias_id}",
+            delete(customers::remove_alias),
+        )
         .route("/invoices", post(invoices::create).get(invoices::list))
         .route("/invoices/{id}", get(invoices::get))
+        .route("/invoices/{id}/void", post(invoices::void))
         .route("/payment-batches", post(payments::import))
         .route("/payments", get(payments::list))
         .route("/payments/rematch", post(payments::rematch))

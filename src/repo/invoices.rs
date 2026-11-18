@@ -21,6 +21,8 @@ pub struct Invoice {
 
 pub const STATUS_OPEN: &str = "open";
 pub const STATUS_CLEARED: &str = "cleared";
+/// Registered by mistake and taken out of matching.
+pub const STATUS_VOID: &str = "void";
 pub const NUMBER_UNIQUE_CONSTRAINT: &str = "invoices_number_key";
 pub const CUSTOMER_FOREIGN_KEY: &str = "invoices_customer_fkey";
 

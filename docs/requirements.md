@@ -1,7 +1,7 @@
 # 入金消込 API — 要件定義書
 
-- 版：v0.4（2026-11-18）
-- 状態：MVP 実装済み。v0.1 からの変更は §10、v0.2 からの変更は §11、v0.3 からの変更は §12。
+- 版：v0.5（2026-11-18）
+- 状態：MVP 実装済み。v0.1 からの変更は §10、v0.2 からの変更は §11、v0.3 からの変更は §12、v0.4 からの変更は §13。
 - 関連：[api.md](api.md)（API リファレンス）、[../README.md](../README.md)（動かし方と設計判断）
 
 この文書は個人開発・学習目的のものです。題材は一般的な経理業務の入金消込で、特定企業の製品の再現ではありません。データはすべて架空です。
@@ -59,10 +59,10 @@
 |---|---|---|
 | `customers`（取引先） | `id`, `name`, `name_kana`（振込名義の読み）, `fee_deducted`（手数料を差し引いて振り込む取引先か） | 文字数 1〜200 |
 | `customer_aliases`（取引先を特定する名義） | `id`, `customer_id`, `alias_raw`, `alias_normalized`, `source`（`kana`＝取引先のカナ名／`manual`／`learned`） | `alias_normalized` は一意で空でない |
-| `invoices`（請求） | `id`, `customer_id`, `invoice_number`, `amount`, `due_date`, `status`（`open`／`cleared`） | `amount > 0`、`invoice_number` は一意 |
+| `invoices`（請求） | `id`, `customer_id`, `invoice_number`, `amount`, `due_date`, `status`（`open`／`cleared`／`void`） | `amount > 0`、`invoice_number` は無効でない請求の中で一意 |
 | `payment_batches`（取り込み単位） | `id`, `idempotency_key`, `request_hash` | `idempotency_key` は一意 |
 | `payments`（入金） | `id`, `batch_id`, `line_no`, `paid_on`, `amount`, `payer_name_raw`, `payer_name_normalized`（正規化できなければ空）, `status`（`unmatched`／`suggested`／`matched`）, `decision`（JSONB：自動判定とその根拠）, `decided_at`（その判定の時刻） | `amount > 0`、`(batch_id, line_no)` は一意 |
-| `matches`（消込） | `id`, `payment_id`, `rule`（`R1`〜`R4`／`manual`）, `state`（`suggested`／`confirmed`／`cancelled`）, `fee_amount`, `confirmed_at`, `cancelled_at`, `cancel_reason`（`dismissed`／`reversed`／`replaced`／`invoice_cleared`） | `fee_amount >= 0`、`cancel_reason` は `cancelled` のときだけ |
+| `matches`（消込） | `id`, `payment_id`, `rule`（`R1`〜`R4`／`manual`）, `state`（`suggested`／`confirmed`／`cancelled`）, `fee_amount`, `confirmed_at`, `cancelled_at`, `cancel_reason`（`dismissed`／`reversed`／`replaced`／`invoice_cleared`／`invoice_voided`） | `fee_amount >= 0`、`cancel_reason` は `cancelled` のときだけ |
 | `match_allocations`（消込の内訳） | `match_id`, `invoice_id`, `amount`（その請求に充てた入金額） | 主キー `(match_id, invoice_id)`、`amount > 0` |
 
 取引先自身のカナ名も `customer_aliases` に `source = 'kana'` として入れる。「ある名義がどの取引先を指すか」を 1 つのテーブルと 1 つの一意制約で決めるためで、取引先名と別名が別々の取引先を指す状態を作れない。
@@ -77,7 +77,7 @@
 | I2 | 1 件の請求が含まれる確定済みの消込は 1 つまで | `UPDATE invoices SET status = 'cleared' WHERE id = ANY(..) AND status = 'open'` の更新行数を請求の件数と比べる。足りなければ 409 でロールバック |
 | I3 | 確定済みの消込では「内訳の合計 = 入金額」かつ「内訳の合計 + 手数料 = 請求額の合計」 | 確定のトランザクション内で検証。自動判定についてはプロパティテストでも検査 |
 | I4 | 状態の値は決められたものだけ | `CHECK` 制約 |
-| I5 | 候補（`suggested`）が指す請求は `open` のものだけ | 請求を `cleared` にする処理が、同じ請求を含む他の入金の候補を取消にし、その入金を `unmatched` に戻す |
+| I5 | 候補（`suggested`）が指す請求は `open` のものだけ | 請求を `cleared` または `void` にする処理が、同じ請求を含む他の入金の候補を取消にし、その入金を `unmatched` に戻す |
 
 入金の `status` は消込から決まる（確定済みの消込があれば `matched`、候補があれば `suggested`、どちらもなければ `unmatched`）。これと I1〜I3、I5 は、操作を無作為な順に実行して 1 回ごとに SQL で検査する結合テストで確かめる（`tests/api.rs` の整合性テスト）。
 
@@ -144,7 +144,14 @@
 
 ### 4.7 取消の理由
 
-消込が `cancelled` になる経路は 4 つあり、`matches.cancel_reason` に残す：人が候補を却下した（`dismissed`）、人が確定済みの消込を取り消した（`reversed`）、人が候補の代わりに手動消込をした（`replaced`）、候補の請求が他の入金で消し込まれた（`invoice_cleared`）。最後のものは人の操作ではないので、理由がないと履歴から区別できない。
+消込が `cancelled` になる経路は 5 つあり、`matches.cancel_reason` に残す：人が候補を却下した（`dismissed`）、人が確定済みの消込を取り消した（`reversed`）、人が候補の代わりに手動消込をした（`replaced`）、候補の請求が他の入金で消し込まれた（`invoice_cleared`）、候補の請求が無効にされた（`invoice_voided`）。最後の 2 つはその入金への操作ではないので、理由がないと履歴から区別できない。
+
+### 4.8 登録の訂正
+
+登録を間違えたときに、DB を直接触らずに直せるようにする。
+
+- **別名の削除**（`DELETE /v1/customers/{id}/aliases/{alias_id}`）。間違った別名は、その名義の入金を以後ずっと R1・R2 で自動確定させるので、消せないと害が続く。取引先自身のカナ名は消せない（取引先の登録そのものの訂正になる）。既にできた消込や候補は変えない：どれが間違いかは人が判断し、消込の取消で直す。
+- **請求の無効化**（`POST /v1/invoices/{id}/void`）。行は消さず `status` を `void` にする。取消済みの候補が請求を指していることがあり、履歴を残すため。未消込の請求だけが対象で、消込済みなら先に消込を取り消す。この請求を含む候補は I5 に従って取消にする。請求番号は無効でない請求の中で一意とし、同じ番号で登録し直せる。元に戻す操作は置かない（登録し直せば足りる）。
 
 ---
 
@@ -264,3 +271,14 @@
 | `decision` | 取り込み時の判定のまま | 再判定で置き換え、`decided_at` を持つ | 再判定で確定した消込の根拠を入金から読めるように |
 | 入金の `status` の決め方（取り込み・再判定） | 判定結果から | その入金の有効な消込から | 同じバッチの後の行が、前の行の候補を取消にすることがある |
 | 取り込みの SQL | 行ごとに名義の解決・請求の読み込み・入金の挿入・消込の挿入（内訳は 1 件ずつ）・請求の更新 | 入金の挿入、照合先の読み込み、判定の保存はバッチで 1 文ずつ。行ごとは消込の挿入（内訳ごと 1 文）と請求の消込（候補の取消ごと 1 文） | ロックを持つ時間を短くする。1,000 行の取り込みが約 2.9 秒から約 1.0 秒（手元の Docker 上の PostgreSQL） |
+
+---
+
+## 13. v0.4 からの変更
+
+| 項目 | v0.4 | v0.5 | 理由 |
+|---|---|---|---|
+| 別名の削除 | できない | `DELETE /v1/customers/{id}/aliases/{alias_id}`（§4.8） | 間違った別名は自動確定を誤らせ続ける |
+| 請求の無効化 | できない | `POST /v1/invoices/{id}/void`、`status` に `void`、`cancel_reason` に `invoice_voided`（§4.8） | 間違って登録した請求が候補や自動確定の対象になり続ける |
+| 請求番号の一意性 | 全体で一意 | 無効でない請求の中で一意 | 無効にした請求を同じ番号で登録し直せるように |
+| Rust の版 | CI は `stable`、Docker イメージは 1.99 | `rust-toolchain.toml` で 1.99 に固定し、CI が Dockerfile との一致を検査 | 新しい stable の clippy で、変更していないコードの CI が落ちるのを防ぐ |
