@@ -2,6 +2,8 @@
 # The queries are checked against .sqlx at build time, so no database is needed to build the image.
 
 # The toolchain is pinned to a minor version, so that the image is built by a compiler the code was tested with.
+# It is the version in rust-toolchain.toml (CI checks that they agree). That file is kept out of the build
+# context, so that rustup does not download a second copy of the compiler the image already has.
 FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
 ENV SQLX_OFFLINE=true

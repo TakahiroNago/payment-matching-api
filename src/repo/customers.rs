@@ -35,7 +35,8 @@ pub enum AliasSource {
 }
 
 impl AliasSource {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Kana => "kana",
             Self::Manual => "manual",
@@ -119,6 +120,33 @@ pub async fn aliases_of(
     )
     .fetch_all(conn)
     .await
+}
+
+pub async fn find_alias(
+    conn: &mut PgConnection,
+    customer_id: CustomerId,
+    alias_id: AliasId,
+) -> sqlx::Result<Option<Alias>> {
+    sqlx::query_as!(
+        Alias,
+        r#"SELECT id AS "id: AliasId", alias_raw AS alias, alias_normalized AS normalized, source, created_at
+           FROM customer_aliases WHERE id = $1 AND customer_id = $2"#,
+        alias_id.0,
+        customer_id.0,
+    )
+    .fetch_optional(conn)
+    .await
+}
+
+/// Deletes an alias, never the customer's own kana name. Returns whether a row was deleted.
+pub async fn delete_alias(conn: &mut PgConnection, alias_id: AliasId) -> sqlx::Result<bool> {
+    let done = sqlx::query!(
+        "DELETE FROM customer_aliases WHERE id = $1 AND source <> 'kana'",
+        alias_id.0,
+    )
+    .execute(conn)
+    .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 pub async fn resolve_payer(

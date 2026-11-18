@@ -1,4 +1,4 @@
-//! Confirming, creating and cancelling matches.
+//! Confirming, creating and cancelling matches, and voiding invoices.
 //!
 //! Invariants, and where each is enforced:
 //!
@@ -8,7 +8,7 @@
 //! - I3: for a confirmed match, the allocations add up to the payment, and allocations + fee add up to the
 //!   invoices. Checked here before anything is confirmed.
 //! - I5: a suggestion names open invoices only. [`clear_invoices`] cancels the suggestions of other payments
-//!   that name an invoice it clears.
+//!   that name an invoice it clears, and [`void_invoice`] those that name the invoice it voids.
 
 use sqlx::{PgConnection, PgPool};
 
@@ -17,6 +17,7 @@ use crate::domain::matching::{Rule, allocate};
 use crate::domain::{CustomerId, InvoiceId, MatchId, PaymentId, Yen};
 use crate::error::{AppError, FieldError};
 use crate::repo::customers::AliasSource;
+use crate::repo::invoices::Invoice;
 use crate::repo::matches::{CancelReason, MatchState};
 use crate::repo::payments::{Payment, PaymentStatus};
 use crate::repo::{customers, invoices, matches, payments};
@@ -136,7 +137,7 @@ pub async fn match_manually(
         .iter()
         .any(|invoice| invoice.status != invoices::STATUS_OPEN)
     {
-        return Err(AppError::conflict("an invoice is already cleared"));
+        return Err(AppError::conflict("an invoice is not open"));
     }
     let customer_id = single_customer(chosen.iter().map(|invoice| invoice.customer_id))
         .ok_or_else(|| AppError::invalid("invoice_ids", "different_customers"))?;
@@ -217,6 +218,36 @@ pub async fn cancel(pool: &PgPool, match_id: MatchId) -> Result<PaymentDetail, A
     let detail = detail_of(&mut tx, found.payment_id).await?;
     tx.commit().await?;
     Ok(detail)
+}
+
+/// Takes an invoice that was registered by mistake out of matching. Only an open invoice can be voided: a
+/// cleared one has a payment matched to it, and that match has to be cancelled first. Suggestions that name
+/// the invoice are cancelled and their payments go back to `unmatched`.
+pub async fn void_invoice(pool: &PgPool, id: InvoiceId) -> Result<Invoice, AppError> {
+    let mut tx = pool.begin().await?;
+    payments::lock_matching(&mut tx).await?;
+
+    let invoice = invoices::find(&mut tx, id)
+        .await?
+        .ok_or(AppError::NotFound("invoice"))?;
+    if invoice.status == invoices::STATUS_CLEARED {
+        return Err(AppError::conflict(
+            "the invoice is cleared; cancel the match that cleared it first",
+        ));
+    }
+    if invoice.status != invoices::STATUS_OPEN {
+        return Err(AppError::conflict("the invoice is already void"));
+    }
+    if !matches::void_invoice(&mut tx, id).await? {
+        return Err(AppError::Internal(format!(
+            "invoice {id} was open but could not be voided"
+        )));
+    }
+    let voided = invoices::find(&mut tx, id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("invoice {id} disappeared")))?;
+    tx.commit().await?;
+    Ok(voided)
 }
 
 /// Registers the payer name of the payment as an alias of the customer, so that the next payment under this

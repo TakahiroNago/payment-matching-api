@@ -115,6 +115,15 @@ impl Api {
         .await
     }
 
+    async fn delete(&self, path: &str) -> Reply {
+        self.send(
+            Self::request(Method::DELETE, path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
     /// Registers a customer and returns its id.
     async fn customer(&self, name: &str, name_kana: &str, fee_deducted: bool) -> String {
         let reply = self
@@ -1889,6 +1898,194 @@ async fn payments_are_listed_by_status(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Corrections: removing an alias, voiding an invoice
+// ---------------------------------------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn a_wrong_alias_is_removed_and_no_longer_identifies_the_customer(pool: PgPool) {
+    let api = Api::new(pool);
+    let yamada = api
+        .customer("株式会社山田商事", "ヤマダショウジ", false)
+        .await;
+    let suzuki = api
+        .customer("鈴木工業株式会社", "スズキコウギョウ", false)
+        .await;
+    api.invoice(&yamada, "INV-001", 110_000, "2026-10-31").await;
+    api.invoice(&yamada, "INV-002", 110_000, "2026-11-30").await;
+
+    // The branch name is registered for the wrong customer, and a payment is confirmed through it.
+    let alias = api
+        .post(
+            &format!("/v1/customers/{yamada}/aliases"),
+            json!({ "alias": "ｽｽﾞｷ ｵｵｻｶｼﾃﾝ" }),
+        )
+        .await;
+    assert_eq!(alias.status, StatusCode::CREATED, "{}", alias.body);
+    let alias_id = id_of(&alias.body);
+    let before = api.import("before", &[("ｽｽﾞｷ ｵｵｻｶｼﾃﾝ", 110_000)]).await;
+    assert_eq!(before.body["payments"][0]["status"], "suggested");
+    assert_eq!(
+        before.body["payments"][0]["decision"]["reason"]["kind"],
+        "same_amount_invoices"
+    );
+
+    let alias_path = format!("/v1/customers/{yamada}/aliases/{alias_id}");
+    // Not under another customer, and not the customer's own kana name.
+    assert_problem(
+        &api.delete(&format!("/v1/customers/{suzuki}/aliases/{alias_id}"))
+            .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    let own = api.get(&format!("/v1/customers/{yamada}")).await.body;
+    assert_eq!(own["aliases"][0]["source"], "kana");
+    assert_problem(
+        &api.delete(&format!(
+            "/v1/customers/{yamada}/aliases/{}",
+            id_of(&own["aliases"][0])
+        ))
+        .await,
+        StatusCode::CONFLICT,
+        "conflict",
+    );
+
+    let removed = api.delete(&alias_path).await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{}", removed.body);
+    assert_eq!(removed.body, Value::Null);
+    let after = api.get(&format!("/v1/customers/{yamada}")).await.body;
+    assert_eq!(after["aliases"].as_array().unwrap().len(), 1);
+    assert_problem(
+        &api.delete(&alias_path).await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+
+    // What was matched through the alias stays; a person decides about it.
+    let earlier = api
+        .get(&format!(
+            "/v1/payments/{}",
+            id_of(&before.body["payments"][0])
+        ))
+        .await
+        .body;
+    assert_eq!(earlier["status"], "suggested");
+
+    // The next payment under the name is not taken for this customer's.
+    let next = api.import("after", &[("ｽｽﾞｷ ｵｵｻｶｼﾃﾝ", 55_000)]).await;
+    assert_eq!(next.body["payments"][0]["status"], "unmatched");
+    assert_eq!(
+        next.body["payments"][0]["decision"]["reason"],
+        "payer_unknown"
+    );
+
+    // And the name is free for the customer it belongs to.
+    let right = api
+        .post(
+            &format!("/v1/customers/{suzuki}/aliases"),
+            json!({ "alias": "ｽｽﾞｷ ｵｵｻｶｼﾃﾝ" }),
+        )
+        .await;
+    assert_eq!(right.status, StatusCode::CREATED, "{}", right.body);
+}
+
+#[sqlx::test]
+async fn a_void_invoice_takes_no_part_in_matching(pool: PgPool) {
+    let api = Api::new(pool);
+    let customer = api
+        .customer("株式会社山田商事", "ヤマダショウジ", false)
+        .await;
+    let wrong = api
+        .invoice(&customer, "INV-001", 55_000, "2026-10-31")
+        .await;
+    let right = api
+        .invoice(&customer, "INV-002", 55_000, "2026-11-30")
+        .await;
+    let paid = api
+        .invoice(&customer, "INV-003", 33_000, "2026-11-30")
+        .await;
+
+    // Two invoices of 55,000: a suggestion, the older one. 33,000 is confirmed.
+    let imported = api
+        .import("void", &[("ﾔﾏﾀﾞｼﾖｳｼﾞ", 55_000), ("ﾔﾏﾀﾞｼﾖｳｼﾞ", 33_000)])
+        .await;
+    let payment = format!("/v1/payments/{}", id_of(&imported.body["payments"][0]));
+    assert_eq!(imported.body["payments"][0]["status"], "suggested");
+    assert_eq!(
+        imported.body["payments"][0]["decision"]["invoice_ids"],
+        json!([wrong])
+    );
+
+    // A cleared invoice has a payment matched to it: not voided.
+    assert_problem(
+        &api.post_empty(&format!("/v1/invoices/{paid}/void")).await,
+        StatusCode::CONFLICT,
+        "conflict",
+    );
+    assert_eq!(api.invoice_status(&paid).await, "cleared");
+
+    // The older invoice was a mistake. Voiding it takes the suggestion with it.
+    let voided = api.post_empty(&format!("/v1/invoices/{wrong}/void")).await;
+    assert_eq!(voided.status, StatusCode::OK, "{}", voided.body);
+    assert_eq!(voided.body["id"], wrong.as_str());
+    assert_eq!(voided.body["status"], "void");
+    let lost = api.get(&payment).await.body;
+    assert_eq!(lost["status"], "unmatched");
+    assert_eq!(lost["matches"][0]["state"], "cancelled");
+    assert_eq!(lost["matches"][0]["cancel_reason"], "invoice_voided");
+
+    assert_problem(
+        &api.post_empty(&format!("/v1/invoices/{wrong}/void")).await,
+        StatusCode::CONFLICT,
+        "conflict",
+    );
+    assert_problem(
+        &api.post_empty("/v1/invoices/019a0000-0000-7000-8000-000000000000/void")
+            .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+
+    // It is listed as void, has no match, and cannot be matched by hand.
+    let listed = api.get("/v1/invoices?status=void").await.body;
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["items"][0]["id"], wrong.as_str());
+    let detail = api.get(&format!("/v1/invoices/{wrong}")).await.body;
+    assert_eq!(detail["status"], "void");
+    assert_eq!(detail["cleared_by"], Value::Null);
+    assert_problem(
+        &api.post(
+            &format!("{payment}/matches"),
+            json!({ "invoice_ids": [wrong] }),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "conflict",
+    );
+
+    // Decided again, the payment has one invoice of its amount left.
+    let again = api.post_empty("/v1/payments/rematch").await;
+    assert_eq!(
+        again.body["summary"],
+        json!({ "total": 1, "matched": 1, "suggested": 0, "unmatched": 0 })
+    );
+    assert_eq!(api.invoice_status(&right).await, "cleared");
+    assert_eq!(api.invoice_status(&wrong).await, "void");
+
+    // The number of the void invoice can be registered again, once.
+    let again = api
+        .invoice(&customer, "INV-001", 66_000, "2026-10-31")
+        .await;
+    assert_ne!(again, wrong);
+    let twice = api
+        .post(
+            "/v1/invoices",
+            json!({ "customer_id": customer, "invoice_number": "INV-001", "amount": 66_000, "due_date": "2026-10-31" }),
+        )
+        .await;
+    assert_problem(&twice, StatusCode::CONFLICT, "conflict");
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Consistency of payments, matches and invoices
 // ---------------------------------------------------------------------------------------------------------
 
@@ -1911,7 +2108,7 @@ const CONSISTENCY_RULES: [(&str, &str); 7] = [
                     'unmatched')",
     ),
     (
-        "I2: a cleared invoice is in exactly one confirmed match, an open invoice in none",
+        "I2: a cleared invoice is in exactly one confirmed match, an open or void invoice in none",
         "SELECT i.id::text || ' is ' || i.status || ' with ' || count(m.id) || ' confirmed matches'
            FROM invoices i
            LEFT JOIN match_allocations a ON a.invoice_id = i.id
@@ -2002,7 +2199,7 @@ async fn run_random_requests(
     api: &Api,
     seed: u64,
     steps: usize,
-) -> ([usize; 7], std::collections::BTreeSet<String>) {
+) -> ([usize; 9], std::collections::BTreeSet<String>) {
     let mut dice = Dice(seed);
     let mut customers = Vec::new();
     for (name, kana, fee_deducted) in [
@@ -2012,12 +2209,12 @@ async fn run_random_requests(
     ] {
         customers.push(api.customer(name, kana, fee_deducted).await);
     }
-    let mut succeeded = [0; 7];
+    let mut succeeded = [0; 9];
     let mut seen = std::collections::BTreeSet::new();
     let mut log: Vec<String> = Vec::new();
 
     for step in 0..steps {
-        let kind = dice.pick(&[0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6]);
+        let kind = dice.pick(&[0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 8]);
         let (what, ok) = match kind {
             // Import one to four lines.
             0 => {
@@ -2081,11 +2278,19 @@ async fn run_random_requests(
                     (format!("confirm {id}"), reply.status == StatusCode::OK)
                 }
             }
-            // Cancel a match, confirmed or suggested.
+            // Cancel a match: every other time a suggestion (there are fewer of them), otherwise any.
             3 => {
+                let wanted = if dice.roll(2) == 0 {
+                    "suggested"
+                } else {
+                    "cancelled"
+                };
                 let active: Vec<String> = sqlx::query_scalar(
-                    "SELECT id::text FROM matches WHERE state <> 'cancelled' ORDER BY id",
+                    "SELECT id::text FROM matches
+                      WHERE state <> 'cancelled' AND (state = $1 OR $1 = 'cancelled')
+                      ORDER BY id",
                 )
+                .bind(wanted)
                 .fetch_all(&api.pool)
                 .await
                 .unwrap();
@@ -2102,14 +2307,21 @@ async fn run_random_requests(
             // without a fee. One time in four the invoice is any open one, which is usually refused.
             4 => {
                 let careless = dice.roll(4) == 0;
+                // Every other time a payment that has a suggestion, which the match replaces.
+                let wanted = if dice.roll(2) == 0 {
+                    "suggested"
+                } else {
+                    "any"
+                };
                 let pairs: Vec<(String, String, i64)> = sqlx::query_as(
                     "SELECT p.id::text, i.id::text, i.amount - p.amount
                        FROM payments p
                        JOIN invoices i ON i.status = 'open' AND ($1 OR i.amount - p.amount IN (0, 440))
-                      WHERE p.status <> 'matched'
+                      WHERE p.status <> 'matched' AND (p.status = $2 OR $2 = 'any')
                       ORDER BY p.id, i.id",
                 )
                 .bind(careless)
+                .bind(wanted)
                 .fetch_all(&api.pool)
                 .await
                 .unwrap();
@@ -2152,6 +2364,43 @@ async fn run_random_requests(
                     format!("rematch of {limit}, {changed} changed"),
                     changed > 0,
                 )
+            }
+            // Void an open invoice.
+            7 => {
+                let open: Vec<String> = sqlx::query_scalar(
+                    "SELECT id::text FROM invoices WHERE status = 'open' ORDER BY id",
+                )
+                .fetch_all(&api.pool)
+                .await
+                .unwrap();
+                if open.is_empty() {
+                    ("void (no open invoice)".to_owned(), false)
+                } else {
+                    let id = &open[dice.roll(open.len())];
+                    let reply = api.post_empty(&format!("/v1/invoices/{id}/void")).await;
+                    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+                    (format!("void {id}"), true)
+                }
+            }
+            // Remove an alias that is not a customer's own kana name.
+            8 => {
+                let aliases: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT customer_id::text, id::text FROM customer_aliases WHERE source <> 'kana'
+                      ORDER BY id",
+                )
+                .fetch_all(&api.pool)
+                .await
+                .unwrap();
+                if aliases.is_empty() {
+                    ("remove alias (none)".to_owned(), false)
+                } else {
+                    let (customer, alias) = &aliases[dice.roll(aliases.len())];
+                    let reply = api
+                        .delete(&format!("/v1/customers/{customer}/aliases/{alias}"))
+                        .await;
+                    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.body);
+                    (format!("remove alias {alias}"), true)
+                }
             }
             // Teach the branch name to a customer. Refused once another customer has it.
             _ => {
@@ -2203,7 +2452,7 @@ async fn run_random_requests(
 #[sqlx::test]
 async fn any_sequence_of_requests_leaves_payments_matches_and_invoices_consistent(pool: PgPool) {
     let api = Api::new(pool);
-    let (succeeded, seen) = run_random_requests(&api, 20_261_118, 250).await;
+    let (succeeded, seen) = run_random_requests(&api, 20_261_118, 400).await;
 
     // The run is worth something only if every kind of request did change the data.
     for (kind, count) in [
@@ -2214,6 +2463,8 @@ async fn any_sequence_of_requests_leaves_payments_matches_and_invoices_consisten
         "manual match",
         "rematch",
         "alias",
+        "void",
+        "remove alias",
     ]
     .iter()
     .zip(succeeded)
@@ -2232,8 +2483,10 @@ async fn any_sequence_of_requests_leaves_payments_matches_and_invoices_consisten
         "matches.cancel_reason=reversed",
         "matches.cancel_reason=replaced",
         "matches.cancel_reason=invoice_cleared",
+        "matches.cancel_reason=invoice_voided",
         "invoices.status=open",
         "invoices.status=cleared",
+        "invoices.status=void",
     ] {
         assert!(seen.contains(state), "never seen: {state}");
     }
@@ -2243,7 +2496,7 @@ async fn any_sequence_of_requests_leaves_payments_matches_and_invoices_consisten
 async fn other_sequences_of_requests_are_consistent_too(pool: PgPool) {
     let api = Api::new(pool);
     // A second seed, in its own database. Change the number to try other sequences.
-    run_random_requests(&api, 7, 250).await;
+    run_random_requests(&api, 7, 400).await;
 }
 
 #[sqlx::test]
